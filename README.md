@@ -58,3 +58,13 @@ Then `pixi shell` to enter the environment, or prefix commands with `pixi run`.
 trace against it, and writes metrics into a structured directory. See
 [`scripts/README.md`](scripts/README.md) for all options and the optimization
 flags.
+
+## Uninstall
+
+```bash
+pixi run clean
+```
+
+This removes the pixi environment, build scratch, and the vLLM clone
+(`.pixi/`, `.tmp/`, `serving_layer/vllm/`). Experiment outputs under
+`experiments/` are left untouched. To start over, re-run the install steps above.
