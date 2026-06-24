@@ -14,7 +14,7 @@ dependencies = [
     "seaborn>=0.13.2",
     "plotly>=6.5.0",
     "orjson>=3.11.7",
-    "torch==2.8.0",
+    "torch==2.12.1",
     "torchvision==0.23.0",
     "torchaudio==2.8.0",
     "transformers>=4.57,<5",
