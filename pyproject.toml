@@ -1,0 +1,94 @@
+[project]
+name = "sutradhara"
+version = "0.1.0"
+dependencies = [
+    "pandas",
+    "numpy<2.3",
+    "matplotlib",
+    "scienceplots",
+    "scipy",
+    "tiktoken",
+    "jupyter",
+    "notebook",
+    "requests",
+    "seaborn>=0.13.2",
+    "plotly>=6.5.0",
+    "orjson>=3.11.7",
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "torchaudio==2.8.0",
+    "transformers>=4.57,<5",
+    "nixl[cu12]>=1.0.0",
+    "quart>=0.20.0",
+    "aiohttp>=3.11.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["sutradhara*"]
+
+[tool.pyright]
+typeCheckingMode = "basic"
+
+[tool.ruff]
+# VS Code defaults usually allow 88 or 120.
+line-length = 88
+
+[tool.ruff.lint]
+# Enable Pyflakes (F), pycodestyle (E, W), and isort (I)
+select = ["F", "E", "W", "I"]
+
+# Ignore specific rules that are often annoying or conflict with formatters
+# E501: Line too long (let the formatter handle this, don't lint for it)
+# E402: Module level import not at top of file (sometimes necessary for scripts)
+ignore = ["E501", "E402"]
+
+# Allow unused variables when underscore-prefixed.
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.format]
+# Like Black, use double quotes for strings.
+quote-style = "double"
+
+# --- Pixi configuration ---
+
+[tool.pixi.workspace]
+channels = ["nvidia", "conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.dependencies]
+cuda-toolkit = "12.9.*"
+python = "3.12.*"
+pip = ">=26.0.1,<27"
+uv = ">=0.5"
+ipykernel = ">=7.2.0,<8"
+pytest = ">=7.0"
+
+[tool.pixi.pypi-dependencies]
+torch = { version = "==2.8.0", index = "https://download.pytorch.org/whl/cu129" }
+torchvision = { version = "==0.23.0", index = "https://download.pytorch.org/whl/cu129" }
+torchaudio = { version = "==2.8.0", index = "https://download.pytorch.org/whl/cu129" }
+sutradhara = { path = ".", editable = true }
+
+[tool.pixi.activation.env]
+CUDA_HOME = "$CONDA_PREFIX"
+CUDA_INC_PATH = "$CONDA_PREFIX/targets/x86_64-linux"
+TMPDIR = "$PIXI_PROJECT_ROOT/.tmp"
+
+[tool.pixi.tasks]
+install-serving-layer = "mkdir -p .tmp && bash serving_layer/setup.sh"
+test = "python -m pytest"
+# Full reset: remove the pixi env, build scratch, and the vLLM clone+binaries.
+# (`pixi clean` alone leaves the ~1.3 GB serving_layer/vllm checkout behind,
+# which then blocks setup.sh's git clone on reinstall.)
+clean = "rm -rf .pixi .tmp serving_layer/vllm"

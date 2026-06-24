@@ -1,0 +1,34 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Serving layer: upstream vLLM is cloned + patched at build time by setup.sh.
+# Only serving_layer/sutradhara.patch is tracked.
+serving_layer/vllm/
+serving_layer/.wheels/
+
+# Experiment outputs
+experiments/
+logs/
+
+# Pixi environment / virtualenvs
+.pixi/
+.env
+.venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Editor / OS / local agent settings
+.vscode/
+.idea/
+.claude/
+.DS_Store
+.tmp/
