@@ -1,0 +1,1756 @@
+diff --git a/benchmarks/disagg_benchmarks/disagg_prefill_proxy_server.py b/benchmarks/disagg_benchmarks/disagg_prefill_proxy_server.py
+index 904f805..4e01ebf 100644
+--- a/benchmarks/disagg_benchmarks/disagg_prefill_proxy_server.py
++++ b/benchmarks/disagg_benchmarks/disagg_prefill_proxy_server.py
+@@ -3,8 +3,10 @@
+ 
+ import argparse
+ import asyncio
++import json
+ import logging
+ import os
++import time
+ 
+ import aiohttp
+ from quart import Quart, Response, make_response, request
+@@ -16,50 +18,113 @@ logging.basicConfig(level=logging.INFO)
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _merge_prefill_into_decode_metrics(decode_metrics, prefill_metrics,
++                                       proxy_timing):
++    """Merge prefill-side metrics into the decode metrics dict in-place.
++
++    After merging, ``decode_metrics`` contains the *combined* view of
++    waiting time, batch composition, preemption state, and a nested
++    ``prefill_metrics`` dict for detailed analysis.
++    """
++    if not prefill_metrics:
++        return
++
++    # Combined waiting time: prefill queue + decode queue + proxy overhead
++    prefill_wait = prefill_metrics.get("waiting_time") or 0.0
++    decode_wait = decode_metrics.get("waiting_time") or 0.0
++    decode_metrics["waiting_time"] = (
++        prefill_wait + decode_wait
++        + proxy_timing.get("proxy_overhead_ms", 0.0)
++    )
++
++    # Prepend prefill batch_metrics so the orchestrator sees the full picture
++    prefill_batches = prefill_metrics.get("batch_metrics") or []
++    decode_batches = decode_metrics.get("batch_metrics") or []
++    if prefill_batches:
++        decode_metrics["batch_metrics"] = prefill_batches + decode_batches
++
++    # Preemption: true if *either* side was preempted
++    if prefill_metrics.get("preempted"):
++        decode_metrics["preempted"] = True
++
++    prefill_preempt = prefill_metrics.get("time_spent_in_preemption_ms") or 0.0
++    decode_preempt = decode_metrics.get("time_spent_in_preemption_ms") or 0.0
++    if prefill_preempt > 0:
++        decode_metrics["time_spent_in_preemption_ms"] = (
++            prefill_preempt + decode_preempt
++        )
++
++    # Expose the prefill-side KV cache hit (the meaningful metric for
++    # prefix-caching analysis — the decode side always sees ~100% after
++    # KV transfer).
++    if "kv_cache_hit_percentage" in prefill_metrics:
++        decode_metrics["prefill_kv_cache_hit_percentage"] = (
++            prefill_metrics["kv_cache_hit_percentage"]
++        )
++
++    # Stash the full prefill metrics + proxy timing for detailed analysis
++    decode_metrics["prefill_metrics"] = {
++        **prefill_metrics,
++        **proxy_timing,
++    }
++
++
++def _patch_sse_event(event_bytes, prefill_metrics, proxy_timing):
++    """If *event_bytes* is an SSE data chunk containing ``metrics``, merge
++    prefill data into it.  Otherwise return the bytes unchanged."""
++    event_str = event_bytes.decode("utf-8", errors="replace").strip()
++    if not event_str or not event_str.startswith("data: "):
++        return event_bytes
++
++    data_str = event_str[6:]
++    if data_str.strip() == "[DONE]":
++        return event_bytes
++
++    try:
++        parsed = json.loads(data_str)
++    except (json.JSONDecodeError, ValueError):
++        return event_bytes
++
++    if parsed.get("metrics") is None:
++        return event_bytes
++
++    _merge_prefill_into_decode_metrics(parsed["metrics"],
++                                       prefill_metrics, proxy_timing)
++    return ("data: " + json.dumps(parsed)).encode()
++
++
+ def parse_args():
+     """parse command line arguments"""
+-    parser = argparse.ArgumentParser(description="vLLM P/D disaggregation proxy server")
++    parser = argparse.ArgumentParser(
++        description="vLLM P/D disaggregation proxy server")
+ 
+-    # Add args
+     parser.add_argument(
+-        "--timeout",
+-        type=float,
+-        default=300,
++        "--timeout", type=float, default=300,
+         help="Timeout for backend service requests in seconds (default: 300)",
+     )
+     parser.add_argument(
+-        "--max-concurrent",
+-        type=int,
+-        default=100,
++        "--max-concurrent", type=int, default=100,
+         help="Maximum concurrent requests to backend services (default: 100)",
+     )
+     parser.add_argument(
+-        "--queue-size",
+-        type=int,
+-        default=500,
++        "--queue-size", type=int, default=500,
+         help="Maximum number of requests in the queue (default: 500)",
+     )
+     parser.add_argument(
+-        "--rate-limit",
+-        type=int,
+-        default=40,
++        "--rate-limit", type=int, default=40,
+         help="Maximum requests per second (default: 40)",
+     )
+     parser.add_argument(
+-        "--port",
+-        type=int,
+-        default=8000,
++        "--port", type=int, default=8000,
+         help="Port to run the server on (default: 8000)",
+     )
+     parser.add_argument(
+-        "--prefill-url",
+-        type=str,
++        "--prefill-url", type=str,
+         default="http://localhost:8100/v1/completions",
+         help="Prefill service endpoint URL",
+     )
+     parser.add_argument(
+-        "--decode-url",
+-        type=str,
++        "--decode-url", type=str,
+         default="http://localhost:8200/v1/completions",
+         help="Decode service endpoint URL",
+     )
+@@ -71,7 +136,6 @@ def main():
+     """parse command line arguments"""
+     args = parse_args()
+ 
+-    # Initialize configuration using command line parameters
+     AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=args.timeout)
+     MAX_CONCURRENT_REQUESTS = args.max_concurrent
+     REQUEST_QUEUE_SIZE = args.queue_size
+@@ -82,11 +146,9 @@ def main():
+ 
+     app = Quart(__name__)
+ 
+-    # Initialize the rate limiter and request queue
+     rate_limiter = RateLimiter(RATE_LIMIT)
+     request_queue = RequestQueue(MAX_CONCURRENT_REQUESTS, REQUEST_QUEUE_SIZE)
+ 
+-    # Attach the configuration object to the application instance
+     app.config.update(
+         {
+             "AIOHTTP_TIMEOUT": AIOHTTP_TIMEOUT,
+@@ -97,65 +159,150 @@ def main():
+         }
+     )
+ 
+-    # Start queue processing on app startup
+     @app.before_serving
+     async def startup():
+         """Start request processing task when app starts serving"""
+         asyncio.create_task(request_queue.process())
+ 
+-    async def forward_request(url, data):
+-        """Forward request to backend service with rate limiting and error handling"""
+-        headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
++    # ------------------------------------------------------------------
++    # Helpers
++    # ------------------------------------------------------------------
++
++    async def _collect_prefill_response(data):
++        """Send prefill request (forced non-streaming) and return parsed
++        JSON dict + wall-clock duration.  Returns ``({}, duration)`` on
++        failure."""
++        headers = {
++            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+ 
+-        # Use rate limiter as context manager
++        prefill_req = data.copy()
++        prefill_req["max_tokens"] = 1
++        prefill_req["stream"] = False
++        prefill_req.pop("stream_options", None)
++
++        t0 = time.monotonic()
+         async with (
+             rate_limiter,
+             aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session,
+         ):
+             try:
+                 async with session.post(
+-                    url=url, json=data, headers=headers
+-                ) as response:
+-                    if response.status == 200:
+-                        # Stream response chunks
+-                        async for chunk_bytes in response.content.iter_chunked(1024):
+-                            yield chunk_bytes
++                    PREFILL_SERVICE_URL, json=prefill_req, headers=headers,
++                ) as resp:
++                    body = await resp.read()
++                    duration_ms = (time.monotonic() - t0) * 1000
++                    if resp.status == 200:
++                        try:
++                            return json.loads(body), duration_ms
++                        except (json.JSONDecodeError, ValueError):
++                            logger.warning("Failed to parse prefill response")
+                     else:
+-                        # Handle backend service errors
+-                        error_text = await response.text()
+-                        logger.error(
+-                            "Backend service error: %s - %s",
+-                            response.status,
+-                            error_text,
+-                        )
++                        logger.error("Prefill backend error: %s", resp.status)
++            except aiohttp.ClientError as e:
++                logger.error("Prefill connection error: %s", e)
++            except asyncio.TimeoutError:
++                logger.error("Prefill request timed out")
++
++        return {}, (time.monotonic() - t0) * 1000
++
++    async def _stream_decode_patched(data, prefill_metrics, proxy_timing):
++        """Async generator that streams the decode response, patching
++        the final SSE chunk to include merged prefill metrics."""
++        headers = {
++            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
++
++        async with (
++            rate_limiter,
++            aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session,
++        ):
++            try:
++                async with session.post(
++                    DECODE_SERVICE_URL, json=data, headers=headers,
++                ) as resp:
++                    if resp.status != 200:
++                        error_text = await resp.text()
++                        logger.error("Decode backend error: %s - %s",
++                                     resp.status, error_text)
+                         yield b'{"error": "Backend service error"}'
++                        return
++
++                    buf = b""
++                    async for chunk in resp.content.iter_any():
++                        buf += chunk
++                        # Emit complete SSE events (delimited by \n\n)
++                        while b"\n\n" in buf:
++                            event_bytes, buf = buf.split(b"\n\n", 1)
++                            patched = _patch_sse_event(
++                                event_bytes, prefill_metrics, proxy_timing)
++                            yield patched + b"\n\n"
++                    # Flush remaining partial data
++                    if buf.strip():
++                        patched = _patch_sse_event(
++                            buf, prefill_metrics, proxy_timing)
++                        yield patched
+             except aiohttp.ClientError as e:
+-                # Handle connection errors
+-                logger.error("Connection error to %s: %s", url, str(e))
++                logger.error("Decode connection error: %s", e)
+                 yield b'{"error": "Service unavailable"}'
+             except asyncio.TimeoutError:
+-                # Handle timeout errors
+-                logger.error("Timeout connecting to %s", url)
++                logger.error("Decode request timed out")
+                 yield b'{"error": "Service timeout"}'
+ 
++    # ------------------------------------------------------------------
++    # Request handler
++    # ------------------------------------------------------------------
++
+     async def process_request():
+-        """Process a single request through prefill and decode stages"""
++        """Process a request through prefill → decode with full metrics."""
+         try:
+             original_request_data = await request.get_json()
+ 
+-            # Create prefill request (max_tokens=1)
+-            prefill_request = original_request_data.copy()
+-            prefill_request["max_tokens"] = 1
++            # Phase 1 — Prefill (non-streaming for easy metrics extraction)
++            prefill_response, prefill_wall_ms = await _collect_prefill_response(
++                original_request_data)
++            prefill_end = time.monotonic()
++
++            prefill_metrics = prefill_response.get("metrics") or {}
++            prefill_vllm_e2e = prefill_metrics.get("e2e_latency_ms") or 0.0
++            proxy_timing = {
++                "prefill_e2e_ms": prefill_wall_ms,
++                # Overhead = wall-clock minus what vLLM reports as its own e2e
++                "proxy_overhead_ms": max(
++                    prefill_wall_ms - prefill_vllm_e2e, 0.0),
++                "prefill_to_decode_gap_ms": 0.0,  # updated below
++            }
+ 
+-            # Execute prefill stage
+-            async for _ in forward_request(PREFILL_SERVICE_URL, prefill_request):
+-                continue
++            # Phase 2 — Decode (stream with metrics patching)
++            decode_start = time.monotonic()
++            proxy_timing["prefill_to_decode_gap_ms"] = (
++                (decode_start - prefill_end) * 1000)
+ 
+-            # Execute decode stage and stream response
+-            generator = forward_request(DECODE_SERVICE_URL, original_request_data)
+-            response = await make_response(generator)
+-            response.timeout = None  # Disable timeout for streaming response
+-            return response
++            is_streaming = original_request_data.get("stream", False)
++
++            if is_streaming:
++                generator = _stream_decode_patched(
++                    original_request_data, prefill_metrics, proxy_timing)
++                resp = await make_response(generator)
++                resp.timeout = None
++                return resp
++            else:
++                # Non-streaming: collect, patch, return
++                chunks = []
++                async for chunk in _stream_decode_patched(
++                    original_request_data, prefill_metrics, proxy_timing,
++                ):
++                    chunks.append(chunk)
++                body = b"".join(chunks)
++                # The body is plain JSON; try to merge metrics directly
++                try:
++                    parsed = json.loads(body)
++                    if parsed.get("metrics") is not None:
++                        _merge_prefill_into_decode_metrics(
++                            parsed["metrics"], prefill_metrics, proxy_timing)
++                        body = json.dumps(parsed).encode()
++                except (json.JSONDecodeError, ValueError):
++                    pass
++                return Response(response=body, status=200,
++                                content_type="application/json")
+ 
+         except Exception:
+             logger.exception("Error processing request")
+@@ -165,13 +312,17 @@ def main():
+                 content_type="application/json",
+             )
+ 
++    @app.route("/health", methods=["GET"])
++    async def health_check():
++        """Health check endpoint for readiness probes."""
++        return Response(response=b'{"status": "ok"}', status=200,
++                        content_type="application/json")
++
+     @app.route("/v1/completions", methods=["POST"])
+     async def handle_request():
+         """Handle incoming API requests with concurrency and rate limiting"""
+-        # Create task for request processing
+         task = asyncio.create_task(process_request())
+ 
+-        # Enqueue request or reject if queue is full
+         if not await request_queue.enqueue(task):
+             return Response(
+                 response=b'{"error": "Server busy, try again later"}',
+@@ -180,10 +331,8 @@ def main():
+             )
+ 
+         try:
+-            # Return the response from the processing task
+             return await task
+         except asyncio.CancelledError:
+-            # Handle task cancellation (timeout or queue full)
+             logger.warning("Request cancelled due to timeout or queue full")
+             return Response(
+                 response=b'{"error": "Request cancelled"}',
+@@ -191,7 +340,6 @@ def main():
+                 content_type="application/json",
+             )
+ 
+-    # Start the Quart server with host can be set to 0.0.0.0
+     app.run(port=PORT)
+ 
+ 
+diff --git a/vllm/engine/protocol.py b/vllm/engine/protocol.py
+index 9aea74d..b0c34b7 100644
+--- a/vllm/engine/protocol.py
++++ b/vllm/engine/protocol.py
+@@ -19,6 +19,7 @@ from vllm.sampling_params import BeamSearchParams, SamplingParams
+ from vllm.tasks import SupportedTask
+ from vllm.transformers_utils.tokenizer import AnyTokenizer
+ from vllm.utils import Device, collect_from_async_generator, random_uuid
++from vllm.v1.engine import OrchestratorHint
+ 
+ logger = init_logger(__name__)
+ 
+@@ -55,6 +56,7 @@ class EngineClient(ABC):
+         lora_request: Optional[LoRARequest] = None,
+         trace_headers: Optional[Mapping[str, str]] = None,
+         priority: int = 0,
++        orchestrator_hints: Optional[list["OrchestratorHint"]] = None
+     ) -> AsyncGenerator[RequestOutput, None]:
+         """Generate outputs for a request."""
+         ...
+diff --git a/vllm/entrypoints/openai/protocol.py b/vllm/entrypoints/openai/protocol.py
+index 8829fa4..776a312 100644
+--- a/vllm/entrypoints/openai/protocol.py
++++ b/vllm/entrypoints/openai/protocol.py
+@@ -421,6 +421,10 @@ class ResponsesRequest(OpenAIBaseModel):
+                                  "non-empty string if provided.")
+         return data
+ 
++class OrchestratorHintParam(BaseModel):
++    start: int
++    end: int
++    type: str
+ 
+ class ChatCompletionRequest(OpenAIBaseModel):
+     # Ordered by official OpenAI API documentation
+@@ -643,6 +647,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
+         default=None,
+         description="KVTransfer parameters used for disaggregated serving.")
+ 
++    orchestrator_hints: Optional[list[OrchestratorHintParam]] = None
++
+     vllm_xargs: Optional[dict[str, Union[str, int, float]]] = Field(
+         default=None,
+         description=("Additional request parameters with string or "
+@@ -1178,6 +1184,8 @@ class CompletionRequest(OpenAIBaseModel):
+         default=None,
+         description="KVTransfer parameters used for disaggregated serving.")
+ 
++    orchestrator_hints: Optional[list[OrchestratorHintParam]] = None
++
+     vllm_xargs: Optional[dict[str, Union[str, int, float]]] = Field(
+         default=None,
+         description=("Additional request parameters with string or "
+@@ -1662,6 +1670,28 @@ class CompletionResponseChoice(OpenAIBaseModel):
+     prompt_token_ids: Optional[list[int]] = None  # For prompt
+ 
+ 
++class CompletionBatchMetric(OpenAIBaseModel):
++    batch_id: int
++    batch_total_tokens: int
++    num_prefills: int
++    num_decodes: int
++    latency_ms: float
++
++class CompletionMetrics(BaseModel):
++    ttft_ms: Optional[float] = None
++    tbt_ms: Optional[list[float]] = None
++    avg_tbt_ms: Optional[float] = None
++    waiting_time: Optional[float] = None
++    e2e_latency_ms: Optional[float] = None
++    num_prompt_tokens: Optional[int] = None
++    num_generated_tokens: Optional[int] = None
++    total_tokens: Optional[int] = None
++    kv_cache_hit_percentage: float = 0.0
++    gpu_cache_usage_percent: Optional[float] = None
++    batch_metrics: Optional[list[CompletionBatchMetric]] = None
++    preempted: Optional[bool] = None
++    time_spent_in_preemption_ms: Optional[float] = None
++
+ class CompletionResponse(OpenAIBaseModel):
+     id: str = Field(default_factory=lambda: f"cmpl-{random_uuid()}")
+     object: Literal["text_completion"] = "text_completion"
+@@ -1672,6 +1702,7 @@ class CompletionResponse(OpenAIBaseModel):
+                                    "priority"]] = None
+     system_fingerprint: Optional[str] = None
+     usage: UsageInfo
++    metrics: Optional[CompletionMetrics] = None
+ 
+     # vLLM-specific fields that are not in OpenAI spec
+     kv_transfer_params: Optional[dict[str, Any]] = Field(
+@@ -1703,6 +1734,7 @@ class CompletionStreamResponse(OpenAIBaseModel):
+     model: str
+     choices: list[CompletionResponseStreamChoice]
+     usage: Optional[UsageInfo] = Field(default=None)
++    metrics: Optional[CompletionMetrics] = None
+ 
+ 
+ class EmbeddingResponseData(OpenAIBaseModel):
+diff --git a/vllm/entrypoints/openai/serving_chat.py b/vllm/entrypoints/openai/serving_chat.py
+index ab4bf75..b511976 100644
+--- a/vllm/entrypoints/openai/serving_chat.py
++++ b/vllm/entrypoints/openai/serving_chat.py
+@@ -29,7 +29,7 @@ from vllm.entrypoints.logger import RequestLogger
+ from vllm.entrypoints.openai.protocol import (
+     ChatCompletionLogProb, ChatCompletionLogProbs,
+     ChatCompletionLogProbsContent, ChatCompletionNamedToolChoiceParam,
+-    ChatCompletionRequest, ChatCompletionResponse,
++    ChatCompletionRequest, OrchestratorHintParam, ChatCompletionResponse,
+     ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice,
+     ChatCompletionStreamResponse, ChatMessage, DeltaFunctionCall, DeltaMessage,
+     DeltaToolCall, ErrorResponse, FunctionCall, FunctionDefinition,
+@@ -52,6 +52,9 @@ from vllm.transformers_utils.tokenizers import (maybe_serialize_tool_calls,
+                                                 truncate_tool_call_ids,
+                                                 validate_request_params)
+ from vllm.utils import as_list
++from vllm.v1.core.kv_block_types import parse_block_type
++from vllm.v1.engine import OrchestratorHint
++
+ 
+ logger = init_logger(__name__)
+ 
+@@ -160,6 +163,20 @@ class OpenAIServingChat(OpenAIServing):
+         self.supports_code_interpreter = False
+         self.python_tool = None
+ 
++    def _convert_orchestrator_hints(
++        self, hints: Optional[list[OrchestratorHintParam]]
++    ) -> Optional[list[OrchestratorHint]]:
++        if not hints:
++            return None
++        return [
++            OrchestratorHint(
++                start=h.start,
++                end=h.end,
++                block_type=parse_block_type(h.type),
++            )
++            for h in hints
++        ]
++
+     async def create_chat_completion(
+         self,
+         request: ChatCompletionRequest,
+@@ -316,6 +333,7 @@ class OpenAIServingChat(OpenAIServing):
+                         lora_request=lora_request,
+                         trace_headers=trace_headers,
+                         priority=request.priority,
++                        orchestrator_hints=self._convert_orchestrator_hints(request.orchestrator_hints)
+                     )
+ 
+                 generators.append(generator)
+diff --git a/vllm/entrypoints/openai/serving_completion.py b/vllm/entrypoints/openai/serving_completion.py
+index 0c61c48..298daa2 100644
+--- a/vllm/entrypoints/openai/serving_completion.py
++++ b/vllm/entrypoints/openai/serving_completion.py
+@@ -18,14 +18,19 @@ from vllm.entrypoints.logger import RequestLogger
+ # yapf: disable
+ from vllm.entrypoints.openai.protocol import (CompletionLogProbs,
+                                               CompletionRequest,
++                                              CompletionMetrics,
++                                              CompletionBatchMetric,
+                                               CompletionResponse,
+                                               CompletionResponseChoice,
+                                               CompletionResponseStreamChoice,
+                                               CompletionStreamResponse,
+                                               ErrorResponse,
++                                              OrchestratorHintParam,
+                                               PromptTokenUsageInfo,
+                                               RequestResponseMetadata,
+                                               UsageInfo)
++from vllm.v1.engine import OrchestratorHint
++from vllm.v1.core.kv_block_types import parse_block_type
+ from vllm.entrypoints.openai.serving_engine import (OpenAIServing,
+                                                     clamp_prompt_logprobs)
+ # yapf: enable
+@@ -79,6 +84,20 @@ class OpenAIServingCompletion(OpenAIServing):
+                 self.default_sampling_params,
+             )
+ 
++    def _convert_orchestrator_hints(
++        self, hints: Optional[list[OrchestratorHintParam]]
++    ) -> Optional[list[OrchestratorHint]]:
++        if not hints:
++            return None
++        return [
++            OrchestratorHint(
++                start=h.start,
++                end=h.end,
++                block_type=parse_block_type(h.type),
++            )
++            for h in hints
++        ]
++
+     async def create_completion(
+         self,
+         request: CompletionRequest,
+@@ -227,6 +246,7 @@ class OpenAIServingCompletion(OpenAIServing):
+                         lora_request=lora_request,
+                         trace_headers=trace_headers,
+                         priority=request.priority,
++                        orchestrator_hints=self._convert_orchestrator_hints(request.orchestrator_hints),
+                     )
+ 
+                 generators.append(generator)
+@@ -330,6 +350,8 @@ class OpenAIServingCompletion(OpenAIServing):
+         num_cached_tokens = None
+         first_iteration = True
+ 
++        last_final_res: Optional[RequestOutput] = None
++
+         stream_options = request.stream_options
+         if stream_options:
+             include_usage = (stream_options.include_usage
+@@ -341,6 +363,8 @@ class OpenAIServingCompletion(OpenAIServing):
+ 
+         try:
+             async for prompt_idx, res in result_generator:
++                last_final_res = res
++
+                 prompt_token_ids = res.prompt_token_ids
+                 prompt_logprobs = res.prompt_logprobs
+ 
+@@ -472,6 +496,14 @@ class OpenAIServingCompletion(OpenAIServing):
+                 final_usage_info.prompt_tokens_details = PromptTokenUsageInfo(
+                     cached_tokens=num_cached_tokens)
+ 
++            metrics = None
++            if last_final_res:
++                metrics = self._collect_completion_metrics(
++                    final_res=last_final_res,
++                    num_prompt_tokens=total_prompt_tokens,
++                    num_generated_tokens=total_completion_tokens,
++                )
++
+             if include_usage:
+                 final_usage_chunk = CompletionStreamResponse(
+                     id=request_id,
+@@ -479,6 +511,7 @@ class OpenAIServingCompletion(OpenAIServing):
+                     model=model_name,
+                     choices=[],
+                     usage=final_usage_info,
++                    metrics=metrics,
+                 )
+                 final_usage_data = final_usage_chunk.model_dump_json(
+                     exclude_unset=False, exclude_none=True)
+@@ -508,6 +541,7 @@ class OpenAIServingCompletion(OpenAIServing):
+         num_generated_tokens = 0
+         kv_transfer_params = None
+         last_final_res = None
++
+         for final_res in final_res_batch:
+             last_final_res = final_res
+             prompt_token_ids = final_res.prompt_token_ids
+@@ -592,6 +626,15 @@ class OpenAIServingCompletion(OpenAIServing):
+         request_metadata.final_usage_info = usage
+         if final_res_batch:
+             kv_transfer_params = final_res_batch[0].kv_transfer_params
++
++        metrics = None
++        if last_final_res:
++            metrics = self._collect_completion_metrics(
++                final_res=last_final_res,
++                num_prompt_tokens=num_prompt_tokens,
++                num_generated_tokens=num_generated_tokens,
++            )
++
+         return CompletionResponse(
+             id=request_id,
+             created=created_time,
+@@ -599,6 +642,7 @@ class OpenAIServingCompletion(OpenAIServing):
+             choices=choices,
+             usage=usage,
+             kv_transfer_params=kv_transfer_params,
++            metrics=metrics,
+         )
+ 
+     def _create_completion_logprobs(
+@@ -676,6 +720,69 @@ class OpenAIServingCompletion(OpenAIServing):
+             top_logprobs=out_top_logprobs,
+         )
+ 
++    def _collect_completion_metrics(
++        self,
++        final_res: RequestOutput,
++        num_prompt_tokens: int,
++        num_generated_tokens: int,
++    ) -> Optional[CompletionMetrics]:
++        try:
++            kv_cache_hit_tokens = final_res.num_cached_tokens or 0
++            kv_cache_hit_percentage = (
++                kv_cache_hit_tokens / num_prompt_tokens
++                if num_prompt_tokens > 0 else 0.0)
++
++            ttft_ms = None
++            waiting_time_ms = None
++            preempted = None
++            preemption_time_ms = None
++            e2e_latency_ms = None
++
++            batch_metrics_payload = None
++            if final_res.metrics and final_res.metrics.batch_metrics:
++                batch_metrics_payload = [
++                    CompletionBatchMetric(
++                        batch_id=metric.batch_id,
++                        batch_total_tokens=metric.batch_total_tokens,
++                        num_prefills=metric.num_prefills,
++                        num_decodes=metric.num_decodes,
++                        latency_ms=metric.latency_ms,
++                    )
++                    for metric in final_res.metrics.batch_metrics
++                ]
++
++            if final_res.metrics:
++                if final_res.metrics.first_token_time is not None:
++                    ttft_ms = final_res.metrics.first_token_time
++                if final_res.metrics.time_in_queue is not None:
++                    waiting_time_ms = final_res.metrics.time_in_queue
++                preempted = final_res.metrics.preempted
++                preemption_time_ms = (
++                    final_res.metrics.time_spent_in_preemption_ms)
++                # finished_time/arrival_time are epoch seconds; every other
++                # field on this payload is milliseconds, so convert.
++                if (final_res.metrics.finished_time is not None
++                        and final_res.metrics.arrival_time is not None):
++                    e2e_latency_ms = (final_res.metrics.finished_time
++                                      - final_res.metrics.arrival_time) * 1000
++
++            return CompletionMetrics(
++                ttft_ms=ttft_ms,
++                e2e_latency_ms=e2e_latency_ms,
++                waiting_time=waiting_time_ms,
++                num_prompt_tokens=num_prompt_tokens,
++                num_generated_tokens=num_generated_tokens,
++                total_tokens=num_prompt_tokens + num_generated_tokens,
++                kv_cache_hit_percentage=kv_cache_hit_percentage,
++                preempted=preempted,
++                time_spent_in_preemption_ms=preemption_time_ms,
++                gpu_cache_usage_percent=None,
++                batch_metrics=batch_metrics_payload,
++            )
++        except Exception as e:
++            logger.warning("Failed to collect completion metrics: %s", e)
++            return None
++
+     def _build_render_config(
+         self,
+         request: CompletionRequest,
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index e5f23d4..b97c349 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -18,6 +18,15 @@ VLLM_TOKEN_ID_ARRAY_TYPE = "l"
+ VLLM_INVALID_TOKEN_ID = -1
+ 
+ 
++@dataclass
++class BatchMetrics:
++    batch_id: int
++    batch_total_tokens: int
++    num_prefills: int
++    num_decodes: int
++    latency_ms: float
++
++
+ @dataclass
+ class RequestMetrics:
+     """Metrics associated with a request.
+@@ -45,6 +54,9 @@ class RequestMetrics:
+     scheduler_time: Optional[float] = None
+     model_forward_time: Optional[float] = None
+     model_execute_time: Optional[float] = None
++    batch_metrics: Optional[list[BatchMetrics]] = None
++    preempted: bool = False
++    time_spent_in_preemption_ms: float = 0.0
+ 
+ 
+ # cannot use msgspec.Struct here because Dynamo does not support it
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index 3cc7383..977be7c 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -9,10 +9,13 @@ from vllm.distributed.kv_events import (MEDIUM_GPU, AllBlocksCleared,
+ from vllm.logger import init_logger
+ from vllm.v1.core.kv_cache_utils import (BlockHash, BlockHashWithGroupId,
+                                          ExternalBlockHash,
+-                                         FreeKVCacheBlockQueue, KVCacheBlock,
++                                         FreeKVCacheBlockQueue,
++                                         PriorityFreeKVCacheBlockQueue,
++                                         KVCacheBlock,
+                                          get_block_hash,
+                                          make_block_hash_with_group_id,
+                                          maybe_convert_block_hash)
++from vllm.v1.core.kv_block_types import KVBlockType
+ from vllm.v1.request import Request
+ 
+ logger = init_logger(__name__)
+@@ -133,11 +136,15 @@ class BlockPool:
+         self,
+         num_gpu_blocks: int,
+         enable_caching: bool,
++        enable_priority_cache_eviction: bool = True,
+         enable_kv_cache_events: bool = False,
++        enable_eviction_tracking: bool = False,
+     ):
+         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
+         self.num_gpu_blocks = num_gpu_blocks
+         self.enable_caching = enable_caching
++        self.enable_priority_cache_eviction = enable_priority_cache_eviction
++        self.enable_eviction_tracking = enable_eviction_tracking
+         # All kv-cache blocks.
+         self.blocks: list[KVCacheBlock] = [
+             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
+@@ -145,7 +152,12 @@ class BlockPool:
+         # Free block queue that constructs and manipulates a doubly linked
+         # list of free blocks (including eviction candidates when caching is
+         # enabled).
+-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
++
++        if not enable_priority_cache_eviction:
++            self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
++        else:
++            self.free_block_queue = PriorityFreeKVCacheBlockQueue(self.blocks)
++
+ 
+         # Cache for block lookup
+         self.cached_block_hash_to_block: BlockHashToBlockMap = \
+@@ -160,6 +172,19 @@ class BlockPool:
+         self.enable_kv_cache_events = enable_kv_cache_events
+         self.kv_event_queue: list[KVCacheEvent] = []
+ 
++        # Eviction tracking: count evictions by block type (observe-only).
++        self._eviction_counts: dict[KVBlockType, int] = {
++            t: 0 for t in KVBlockType
++        }
++
++    def get_and_reset_eviction_counts(self) -> dict[str, int]:
++        """Return eviction counts by block type and reset counters."""
++        counts = {t.name.lower(): c
++                  for t, c in self._eviction_counts.items() if c > 0}
++        for t in self._eviction_counts:
++            self._eviction_counts[t] = 0
++        return counts
++
+     def get_cached_block(
+             self, block_hash: BlockHash,
+             kv_cache_group_ids: list[int]) -> Optional[list[KVCacheBlock]]:
+@@ -305,6 +330,9 @@ class BlockPool:
+             # eviction is not needed
+             return False
+ 
++        if self.enable_eviction_tracking:
++            self._eviction_counts[block.type] += 1
++
+         block.reset_hash()
+ 
+         if self.enable_kv_cache_events:
+diff --git a/vllm/v1/core/kv_block_types.py b/vllm/v1/core/kv_block_types.py
+new file mode 100644
+index 0000000..f6097f4
+--- /dev/null
++++ b/vllm/v1/core/kv_block_types.py
+@@ -0,0 +1,32 @@
++from enum import Enum
++
++
++class KVBlockType(Enum):
++    """KV-block eviction tiers, low->high priority (first evicted first)."""
++
++    BASELINE = -1      # unlabeled decode output; evicted first
++    RESPONSE = 0       # reserved; not emitted by the partitioner
++    NO_PRIORITY = 1
++    TOOL_OUTPUT = 2    # conversation history; bulk of the reusable prefix
++    USER_QUERY = 3     # user message; eviction cascades to later blocks
++    SYSTEM_PROMPT = 4  # system prompt + tool defs; shared across requests
++    SPLIT_A = 5        # pinned prefill prefix; evicted last
++
++
++BLOCK_TYPE_NAMES: dict[str, int] = {
++    "split_a": KVBlockType.SPLIT_A.value,
++    "system_prompt": KVBlockType.SYSTEM_PROMPT.value,
++    "user_query": KVBlockType.USER_QUERY.value,
++    "tool_output": KVBlockType.TOOL_OUTPUT.value,
++    "no_priority": KVBlockType.NO_PRIORITY.value,
++    "response": KVBlockType.RESPONSE.value,
++}
++
++
++def parse_block_type(type_str: str) -> int:
++    """Convert an API block-type string to its enum value."""
++    if type_str not in BLOCK_TYPE_NAMES:
++        valid = ", ".join(BLOCK_TYPE_NAMES)
++        raise ValueError(
++            f"Unknown block type: '{type_str}'. Valid types: {valid}")
++    return BLOCK_TYPE_NAMES[type_str]
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 8677106..82681ad 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from abc import ABC, abstractmethod
+ from typing import Optional
+ 
+@@ -11,6 +12,9 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
+                                         KVCacheSpec)
+ from vllm.v1.request import Request
+ 
++_EVICTION_TRACKING_ENV = "VLLM_TRACK_EVICTION_TYPES"
++_DISABLE_PRIORITY_EVICTION_ENV = "VLLM_DISABLE_PRIORITY_EVICTION"
++
+ 
+ class KVCacheCoordinator(ABC):
+     """
+@@ -25,13 +29,25 @@ class KVCacheCoordinator(ABC):
+         enable_caching: bool,
+         enable_kv_cache_events: bool,
+         dcp_world_size: int,
++        enable_eviction_tracking: bool = False,
+     ):
+         self.kv_cache_config = kv_cache_config
+         self.max_model_len = max_model_len
+         self.enable_caching = enable_caching
+ 
+-        self.block_pool = BlockPool(kv_cache_config.num_blocks, enable_caching,
+-                                    enable_kv_cache_events)
++        # Allow env-var override for eviction tracking.
++        if not enable_eviction_tracking:
++            enable_eviction_tracking = bool(
++                os.environ.get(_EVICTION_TRACKING_ENV, ""))
++
++        # Allow env-var to force LRU (disable priority eviction).
++        force_lru = bool(os.environ.get(_DISABLE_PRIORITY_EVICTION_ENV, ""))
++
++        self.block_pool = BlockPool(
++            kv_cache_config.num_blocks, enable_caching,
++            enable_priority_cache_eviction=not force_lru,
++            enable_kv_cache_events=enable_kv_cache_events,
++            enable_eviction_tracking=enable_eviction_tracking)
+ 
+         # Needs special handling for find_longest_cache_hit if eagle is enabled
+         self.use_eagle = use_eagle
+@@ -418,7 +434,9 @@ def get_kv_cache_coordinator(kv_cache_config: KVCacheConfig,
+                              max_model_len: int, use_eagle: bool,
+                              enable_caching: bool,
+                              enable_kv_cache_events: bool,
+-                             dcp_world_size: int) -> KVCacheCoordinator:
++                             dcp_world_size: int,
++                             enable_eviction_tracking: bool = False,
++                             ) -> KVCacheCoordinator:
+     if not enable_caching:
+         return KVCacheCoordinatorNoPrefixCache(kv_cache_config,
+                                                max_model_len,
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 401327f..84aec0b 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -8,6 +8,7 @@ from vllm.distributed.kv_events import KVCacheEvent
+ from vllm.logger import init_logger
+ from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
+ from vllm.v1.core.kv_cache_utils import KVCacheBlock
++from vllm.v1.core.kv_block_types import KVBlockType
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.metrics.stats import PrefixCacheStats
+ from vllm.v1.request import Request, RequestStatus
+@@ -130,6 +131,11 @@ class KVCacheManager:
+         self.block_pool = self.coordinator.block_pool
+         self.kv_cache_config = kv_cache_config
+ 
++        # Track how many blocks have been labeled per request so that
++        # incremental labeling across chunked-prefill steps only processes
++        # newly allocated blocks.
++        self._labeled_block_counts: dict[str, int] = {}
++
+     @property
+     def usage(self) -> float:
+         """Get the KV cache usage.
+@@ -301,8 +307,84 @@ class KVCacheManager:
+                                   request.num_tokens)
+         self.coordinator.cache_blocks(request, num_tokens_to_cache)
+ 
++        # Labelling Logic — incremental across chunked-prefill steps.
++        # Labels are applied when priority eviction OR eviction tracking is on.
++        if (self.block_pool.enable_priority_cache_eviction
++                or self.block_pool.enable_eviction_tracking) \
++                and request.orchestrator_hints:
++            all_blocks = self.coordinator.get_blocks(request.request_id)
++            current_count = len(all_blocks[0]) if all_blocks else 0
++            prev_count = self._labeled_block_counts.get(
++                request.request_id, 0)
++            if current_count > prev_count:
++                self._label_kv_blocks(
++                    request, all_blocks, start_block_idx=prev_count)
++                self._labeled_block_counts[request.request_id] = \
++                    current_count
++
+         return KVCacheBlocks(new_blocks)
+ 
++    def _label_kv_blocks(
++        self,
++        request: Request,
++        all_blocks: tuple[list[KVCacheBlock], ...],
++        start_block_idx: int = 0,
++    ) -> None:
++        """Label KV blocks for a request using orchestrator hints.
++
++        Only processes blocks from *start_block_idx* onwards so that
++        chunked-prefill steps pay O(new_blocks * L) instead of O(B * L).
++        When a block spans two hint regions the higher-priority type wins.
++        """
++        if not request.orchestrator_hints or self.block_size is None:
++            return
++
++        block_size = self.block_size
++
++        # Sort hints by start token — O(H log H), H is typically 3-10.
++        sorted_hints = sorted(request.orchestrator_hints.items(),
++                              key=lambda item: item[0][0])
++        num_hints = len(sorted_hints)
++
++        num_blocks = len(all_blocks[0]) if all_blocks else 0
++        block_labels: list[Optional[KVBlockType]] = [None] * num_blocks
++
++        # Advance hint_idx past hints that end before start_block_idx.
++        hint_idx = 0
++        if start_block_idx > 0:
++            start_token = start_block_idx * block_size
++            while hint_idx < num_hints and (
++                    sorted_hints[hint_idx][0][1] <= start_token):
++                hint_idx += 1
++
++        for block_idx in range(start_block_idx, num_blocks):
++            block_start = block_idx * block_size
++            block_end = block_start + block_size
++
++            # Advance past hints that end at or before this block.
++            while hint_idx < num_hints and (
++                    sorted_hints[hint_idx][0][1] <= block_start):
++                hint_idx += 1
++
++            # Scan overlapping hints (usually 1, at most 2 at boundaries).
++            best_type: Optional[KVBlockType] = None
++            j = hint_idx
++            while j < num_hints and sorted_hints[j][0][0] < block_end:
++                hint_type = sorted_hints[j][1]
++                if best_type is None or hint_type.value > best_type.value:
++                    best_type = hint_type
++                j += 1
++
++            block_labels[block_idx] = best_type
++
++        # Apply labels only to new blocks — O(new_blocks * L).
++        for layer_blocks in all_blocks:
++            for block_idx in range(start_block_idx, len(layer_blocks)):
++                label = block_labels[block_idx]
++                if label is not None:
++                    layer_blocks[block_idx].type = label
++
++
+     def free(self, request: Request) -> None:
+         """Free the blocks allocated for the request.
+         We free the blocks in reverse order so that the tail blocks are evicted
+@@ -311,6 +393,7 @@ class KVCacheManager:
+         Args:
+             request: The request to free the blocks.
+         """
++        self._labeled_block_counts.pop(request.request_id, None)
+         self.coordinator.free(request.request_id)
+ 
+     def reset_prefix_cache(self) -> bool:
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 2ff1bb6..2bcd5e4 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import (ChunkedLocalAttentionSpec,
+                                         UniformTypeKVCacheSpecs)
+ from vllm.v1.metrics.stats import PrefixCacheStats
+ from vllm.v1.request import Request
++from vllm.v1.core.kv_block_types import KVBlockType
+ 
+ # BlockHash represents the hash of a single KV-cache block used for
+ # prefix caching.  Treating it as a distinct type from ``bytes`` helps
+@@ -185,6 +186,8 @@ class KVCacheBlock:
+     # Whether the block is a null block that should never be cached.
+     is_null: bool = False
+ 
++    type: KVBlockType = KVBlockType.BASELINE
++
+     @property
+     def block_hash(self) -> Optional[BlockHashWithGroupId]:
+         return self._block_hash
+@@ -196,8 +199,9 @@ class KVCacheBlock:
+         self._block_hash = block_hash
+ 
+     def reset_hash(self):
+-        """Reset the block hash when the block is evicted."""
++        """Reset the block hash and type when the block is evicted."""
+         self._block_hash = None
++        self.type = KVBlockType.BASELINE
+ 
+     def __repr__(self) -> str:
+         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
+@@ -416,6 +420,56 @@ class FreeKVCacheBlockQueue:
+             curr_block = curr_block.next_free_block
+         return ret
+ 
++class PriorityFreeKVCacheBlockQueue:
++    def __init__(self, blocks: list[KVCacheBlock]) -> None:
++        self.priority_free_kv_cache_block_queues = {}
++        self.num_free_blocks = len(blocks)
++        queues = self.priority_free_kv_cache_block_queues
++        for block_type in KVBlockType:
++            initial = blocks if block_type == KVBlockType.BASELINE else []
++            queues[block_type] = FreeKVCacheBlockQueue(initial)
++
++    def append(self, block: KVCacheBlock) -> None:
++        self.priority_free_kv_cache_block_queues[block.type].append(block)
++        self.num_free_blocks += 1
++
++    def append_n(self, blocks: list[KVCacheBlock]):
++        if not blocks:
++            return
++        # Route each block to its type's sub-queue. Single loop, no
++        # grouping/allocation overhead.  ~200µs for 4000 blocks (64K tokens)
++        # which is <0.5% of a forward pass at that length.
++        queues = self.priority_free_kv_cache_block_queues
++        for block in blocks:
++            queues[block.type].append(block)
++        self.num_free_blocks += len(blocks)
++
++    def popleft(self) -> KVCacheBlock:
++        blocks_freed = self.popleft_n(1)
++        assert len(blocks_freed) == 1
++        return blocks_freed[0]
++
++    def popleft_n(self, n) -> list[KVCacheBlock]:
++        blocks_freed_list = []
++        queues = self.priority_free_kv_cache_block_queues
++        # Iterate in definition order: lowest eviction priority first.
++        for block_type in KVBlockType:
++            if n <= 0:
++                break
++            free_block_queue = queues[block_type]
++            num_to_pop = min(n, free_block_queue.num_free_blocks)
++            if num_to_pop == 0:
++                continue
++            blocks_freed = free_block_queue.popleft_n(num_to_pop)
++            blocks_freed_list.extend(blocks_freed)
++            n -= len(blocks_freed)
++
++        self.num_free_blocks -= len(blocks_freed_list)
++        return blocks_freed_list
++
++    def remove(self, block: KVCacheBlock) -> None:
++        self.priority_free_kv_cache_block_queues[block.type].remove(block)
++        self.num_free_blocks -= 1
+ 
+ def need_extra_keys(request: Request) -> bool:
+     """Check whether the blocks allocated to this request need extra hash keys.
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 209fc2a..c1335dc 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -7,6 +7,7 @@ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Optional
+ 
+ from vllm._bc_linter import bc_linter_include
++from vllm.v1.metrics.batch import BatchRequestMetrics
+ 
+ if TYPE_CHECKING:
+     import numpy as np
+@@ -164,3 +165,5 @@ class SchedulerOutput:
+ 
+     # KV Cache Connector metadata.
+     kv_connector_metadata: Optional[KVConnectorMetadata] = None
++
++    batch_metrics: Optional[list[BatchRequestMetrics]] = None
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 2b2cd63..0c24b7a 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -3,7 +3,10 @@
+ 
+ from __future__ import annotations
+ 
++import csv
+ import itertools
++import json
++import os
+ import time
+ from collections import defaultdict
+ from collections.abc import Iterable
+@@ -31,6 +34,7 @@ from vllm.v1.core.sched.utils import check_stop, remove_all
+ from vllm.v1.engine import (EngineCoreEventType, EngineCoreOutput,
+                             EngineCoreOutputs)
+ from vllm.v1.kv_cache_interface import KVCacheConfig
++from vllm.v1.metrics.batch import BatchRequestMetrics
+ from vllm.v1.metrics.stats import SchedulerStats
+ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+ from vllm.v1.request import Request, RequestStatus
+@@ -175,6 +179,8 @@ class Scheduler(SchedulerInterface):
+             dcp_world_size=self.dcp_world_size,
+         )
+         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
++        self._next_batch_id = 0
++        self._batch_creation_times: list[tuple[int, float]] = []
+ 
+     def schedule(self) -> SchedulerOutput:
+         # NOTE(woosuk) on the scheduling algorithm:
+@@ -576,6 +582,26 @@ class Scheduler(SchedulerInterface):
+         )
+         scheduled_requests = (scheduled_new_reqs + scheduled_running_reqs +
+                               scheduled_resumed_reqs)
++        per_request_batch_metrics: list[BatchRequestMetrics] = []
++        if total_num_scheduled_tokens > 0 and scheduled_requests:
++            for req in scheduled_requests:
++                tokens_scheduled = num_scheduled_tokens.get(req.request_id, 0)
++
++                prefill_tokens = tokens_scheduled if tokens_scheduled > 1 else 0
++                decode_tokens = 1 if tokens_scheduled == 1 else 0
++
++                per_request_batch_metrics.append(
++                    BatchRequestMetrics(
++                        batch_id=self._next_batch_id,
++                        request_id=req.request_id,
++                        batch_total_tokens=total_num_scheduled_tokens,
++                        num_prompts=prefill_tokens,
++                        num_decodes=decode_tokens,
++                        latency_ms=None,
++                    ))
++
++            if per_request_batch_metrics:
++                self._next_batch_id += 1
+         structured_output_request_ids, grammar_bitmask = (
+             self.get_grammar_bitmask(scheduled_requests,
+                                      scheduled_spec_decode_tokens))
+@@ -596,6 +622,7 @@ class Scheduler(SchedulerInterface):
+             get_freed_mm_hashes(),
+             structured_output_request_ids=structured_output_request_ids,
+             grammar_bitmask=grammar_bitmask,
++            batch_metrics=per_request_batch_metrics,
+         )
+ 
+         # NOTE(Kuntai): this function is designed for multiple purposes:
+@@ -624,6 +651,12 @@ class Scheduler(SchedulerInterface):
+             self.kv_event_publisher.publish(batch)
+ 
+         self._update_after_schedule(scheduler_output)
++
++        end_schedule_timestamp = time.monotonic()
++
++        latency_ms = (end_schedule_timestamp - scheduled_timestamp) * 1000
++        self._batch_creation_times.append(
++            (self._next_batch_id - 1, latency_ms))
+         return scheduler_output
+ 
+     def _update_after_schedule(
+@@ -997,6 +1030,15 @@ class Scheduler(SchedulerInterface):
+             for client_index, outs in outputs.items()
+         }
+ 
++        batch_metrics = scheduler_output.batch_metrics
++        if batch_metrics is not None:
++            if engine_core_outputs:
++                for eco in engine_core_outputs.values():
++                    eco.batch_metrics = batch_metrics
++            else:
++                engine_core_outputs[0] = EngineCoreOutputs(
++                    batch_metrics=batch_metrics)
++
+         finished_req_ids = self.finished_req_ids_dict
+         if finished_req_ids:
+             # Include ids of requests that finished since last outputs
+@@ -1097,6 +1139,13 @@ class Scheduler(SchedulerInterface):
+     def add_request(self, request: Request) -> None:
+         self.waiting.add_request(request)
+         self.requests[request.request_id] = request
++        if request.orchestrator_hints:
++            logger.info(
++                "Request %s received %d orchestrator hints: %s",
++                request.request_id,
++                len(request.orchestrator_hints),
++                request.orchestrator_hints,
++            )
+         if self.log_stats:
+             request.record_event(EngineCoreEventType.QUEUED)
+ 
+@@ -1213,6 +1262,24 @@ class Scheduler(SchedulerInterface):
+         if self.connector is not None:
+             self.connector.shutdown()
+ 
++        metrics_dir = os.environ.get('VLLM_METRICS_DIR', '/tmp')
++
++        # store scheduling metrics
++        csv_path = os.path.join(metrics_dir, 'batch_creation_times.csv')
++        with open(csv_path, 'w', newline='') as f:
++            writer = csv.writer(f)
++            writer.writerow(['batch_id', 'latency'])
++            writer.writerows(self._batch_creation_times)
++
++        # store eviction tracking counts (observe-only)
++        eviction_counts = (
++            self.kv_cache_manager.block_pool
++            .get_and_reset_eviction_counts())
++        if eviction_counts:
++            eviction_path = os.path.join(metrics_dir, 'eviction_counts.json')
++            with open(eviction_path, 'w') as f:
++                json.dump(eviction_counts, f, indent=2)
++
+     ########################################################################
+     # KV Connector Related Methods
+     ########################################################################
+diff --git a/vllm/v1/engine/__init__.py b/vllm/v1/engine/__init__.py
+index 345f5a4..97afe64 100644
+--- a/vllm/v1/engine/__init__.py
++++ b/vllm/v1/engine/__init__.py
+@@ -13,6 +13,7 @@ from vllm.lora.request import LoRARequest
+ from vllm.multimodal.inputs import MultiModalFeatureSpec
+ from vllm.pooling_params import PoolingParams
+ from vllm.sampling_params import SamplingParams
++from vllm.v1.metrics.batch import BatchRequestMetrics
+ from vllm.v1.metrics.stats import SchedulerStats
+ from vllm.v1.outputs import LogprobsLists, LogprobsTensors
+ 
+@@ -39,6 +40,10 @@ class FinishReason(enum.IntEnum):
+     def __str__(self):
+         return FINISH_REASON_STRINGS[self.value]
+ 
++class OrchestratorHint(msgspec.Struct, array_like=True):
++    start: int
++    end: int
++    block_type: int
+ 
+ class EngineCoreRequest(
+         msgspec.Struct,
+@@ -57,6 +62,7 @@ class EngineCoreRequest(
+     cache_salt: Optional[str]
+     data_parallel_rank: Optional[int]
+     prompt_embeds: Optional[torch.Tensor] = None
++    orchestrator_hints: Optional[list[OrchestratorHint]] = None
+ 
+     # Index of the client, used to ensure outputs are sent back to the same
+     # client for this request when scaling out the front-end.
+@@ -169,6 +175,8 @@ class EngineCoreOutputs(
+     # "old" wave, so the next wave needs to be started in other engines.
+     start_wave: Optional[int] = None
+ 
++    batch_metrics: Optional[list[BatchRequestMetrics]] = None
++
+     def __post_init__(self):
+         if self.timestamp == 0.0:
+             self.timestamp = time.monotonic()
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index 757baec..16b05cb 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -34,7 +34,7 @@ from vllm.transformers_utils.tokenizer import (AnyTokenizer,
+ from vllm.usage.usage_lib import UsageContext
+ from vllm.utils import (Device, as_list, cancel_task_threadsafe, cdiv,
+                         deprecate_kwargs)
+-from vllm.v1.engine import EngineCoreRequest
++from vllm.v1.engine import EngineCoreRequest, OrchestratorHint
+ from vllm.v1.engine.core_client import EngineCoreClient
+ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
+ from vllm.v1.engine.output_processor import (OutputProcessor,
+@@ -269,6 +269,7 @@ class AsyncLLM(EngineClient):
+         trace_headers: Optional[Mapping[str, str]] = None,
+         priority: int = 0,
+         data_parallel_rank: Optional[int] = None,
++        orchestrator_hints: Optional[list[OrchestratorHint]] = None
+     ) -> RequestOutputCollector:
+         """Add new request to the AsyncLLM."""
+ 
+@@ -283,7 +284,8 @@ class AsyncLLM(EngineClient):
+         # Convert Input --> Request.
+         prompt_str, request = self.processor.process_inputs(
+             request_id, prompt, params, arrival_time, lora_request,
+-            tokenization_kwargs, trace_headers, priority, data_parallel_rank)
++            tokenization_kwargs, trace_headers, priority, data_parallel_rank,
++            orchestrator_hints=orchestrator_hints)
+ 
+         if is_pooling or params.n == 1:
+             await self._add_request(request, prompt_str, None, 0, queue)
+@@ -329,6 +331,7 @@ class AsyncLLM(EngineClient):
+         trace_headers: Optional[Mapping[str, str]] = None,
+         priority: int = 0,
+         data_parallel_rank: Optional[int] = None,
++        orchestrator_hints: Optional[list[OrchestratorHint]] = None
+     ) -> AsyncGenerator[RequestOutput, None]:
+         """
+         Main function called by the API server to kick off a request
+@@ -376,6 +379,7 @@ class AsyncLLM(EngineClient):
+                 priority=priority,
+                 tokenization_kwargs=tokenization_kwargs,
+                 data_parallel_rank=data_parallel_rank,
++                orchestrator_hints=orchestrator_hints
+             )
+ 
+             # The output_handler task pushes items into the queue.
+@@ -455,7 +459,10 @@ class AsyncLLM(EngineClient):
+                     for i, outputs_slice in enumerate(slices):
+                         # 2) Process EngineCoreOutputs.
+                         processed_outputs = output_processor.process_outputs(
+-                            outputs_slice, outputs.timestamp, iteration_stats)
++                            outputs_slice,
++                            outputs.timestamp,
++                            iteration_stats,
++                            outputs.batch_metrics)
+                         # NOTE: RequestOutputs are pushed to their queues.
+                         assert not processed_outputs.request_outputs
+ 
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index a43042a..9ab6509 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -45,6 +45,7 @@ from vllm.v1.engine.utils import (EngineHandshakeMetadata, EngineZmqAddresses,
+                                   get_device_indices)
+ from vllm.v1.executor.abstract import Executor
+ from vllm.v1.kv_cache_interface import KVCacheConfig
++from vllm.v1.metrics.batch import BatchRequestMetrics
+ from vllm.v1.metrics.stats import SchedulerStats
+ from vllm.v1.outputs import ModelRunnerOutput
+ from vllm.v1.request import Request, RequestStatus
+@@ -281,9 +282,22 @@ class EngineCore:
+         if not self.scheduler.has_requests():
+             return {}, False
+         scheduler_output = self.scheduler.schedule()
++        batch_metrics = scheduler_output.batch_metrics
++        exec_start = time.monotonic() if batch_metrics else None
+         model_output = self.execute_model_with_error_logging(
+             self.model_executor.execute_model,  # type: ignore
+             scheduler_output)
++        if batch_metrics:
++            end_ts = time.monotonic()
++            scheduler_output.batch_metrics = tuple(
++                BatchRequestMetrics(
++                    batch_id=req.batch_id,
++                    request_id=req.request_id,
++                    batch_total_tokens=req.batch_total_tokens,
++                    num_prompts=req.num_prompts,
++                    num_decodes=req.num_decodes,
++                    latency_ms=(end_ts - exec_start) * 1000.0
++                ) for req in batch_metrics)
+         engine_core_outputs = self.scheduler.update_from_output(
+             scheduler_output, model_output)  # type: ignore
+ 
+@@ -343,8 +357,21 @@ class EngineCore:
+ 
+         # Block until the next result is available.
+         future, scheduler_output = batch_queue.pop()
++        batch_metrics = scheduler_output.batch_metrics
++        exec_start = time.monotonic()
+         model_output = self.execute_model_with_error_logging(
+             lambda _: future.result(), scheduler_output)
++        if batch_metrics:
++            end_ts = time.monotonic()
++            scheduler_output.batch_metrics = tuple(
++                BatchRequestMetrics(
++                    batch_id=req.batch_id,
++                    request_id=req.request_id,
++                    batch_total_tokens=req.batch_total_tokens,
++                    num_prompts=req.num_prompts,
++                    num_decodes=req.num_decodes,
++                    latency_ms=(end_ts - exec_start) * 1000.0,
++                ) for req in batch_metrics)
+ 
+         engine_core_outputs = self.scheduler.update_from_output(
+             scheduler_output, model_output)
+diff --git a/vllm/v1/engine/core_client.py b/vllm/v1/engine/core_client.py
+index a84b0e5..42009a7 100644
+--- a/vllm/v1/engine/core_client.py
++++ b/vllm/v1/engine/core_client.py
+@@ -825,7 +825,15 @@ class AsyncMPClient(MPClient):
+                             return
+                         await output_handler(_self, outputs)
+ 
+-                    if outputs.outputs or outputs.scheduler_stats:
++                    has_payload = (
++                        outputs.outputs
++                        or outputs.scheduler_stats
++                        or outputs.batch_metrics
++                        or outputs.finished_requests
++                        or outputs.wave_complete is not None
++                        or outputs.start_wave is not None
++                    )
++                    if has_payload:
+                         outputs_queue.put_nowait(outputs)
+             except Exception as e:
+                 outputs_queue.put_nowait(e)
+diff --git a/vllm/v1/engine/llm_engine.py b/vllm/v1/engine/llm_engine.py
+index 2738776..40511d9 100644
+--- a/vllm/v1/engine/llm_engine.py
++++ b/vllm/v1/engine/llm_engine.py
+@@ -269,7 +269,8 @@ class LLMEngine:
+         processed_outputs = self.output_processor.process_outputs(
+             outputs.outputs,
+             engine_core_timestamp=outputs.timestamp,
+-            iteration_stats=iteration_stats)
++            iteration_stats=iteration_stats,
++            batch_metrics=outputs.batch_metrics)
+ 
+         # 3) Abort any reqs that finished due to stop strings.
+         self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index 38b2d68..2d9dc16 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -6,10 +6,11 @@ from collections.abc import Iterable
+ from dataclasses import dataclass
+ from typing import Any, Optional, Union, cast
+ 
++import time
+ import torch
+ 
+ from vllm.outputs import (CompletionOutput, PoolingOutput,
+-                          PoolingRequestOutput, RequestOutput)
++                          PoolingRequestOutput, RequestMetrics, RequestOutput)
+ from vllm.sampling_params import RequestOutputKind
+ from vllm.tracing import (SpanAttributes, SpanKind, Tracer,
+                           extract_trace_context)
+@@ -21,6 +22,8 @@ from vllm.v1.engine.logprobs import LogprobsProcessor
+ from vllm.v1.engine.parallel_sampling import ParentRequest
+ from vllm.v1.metrics.stats import (IterationStats, LoRARequestStates,
+                                    RequestStateStats)
++from vllm.v1.metrics.batch import BatchRequestMetrics
++from vllm.sequence import BatchMetrics
+ 
+ 
+ class RequestOutputCollector:
+@@ -118,9 +121,10 @@ class RequestState:
+         self.is_prefilling = True
+         self.queue = queue
+         self.num_cached_tokens = 0
++        self.batch_metrics = []
++        self.last_recorded_batch_id: Optional[int] = None
+ 
+-        self.stats = RequestStateStats(
+-            arrival_time=arrival_time) if log_stats else None
++        self.stats = RequestStateStats(arrival_time=arrival_time)
+ 
+     @classmethod
+     def from_new_request(
+@@ -248,6 +252,33 @@ class RequestState:
+         if prompt_token_ids is None and self.prompt_embeds is not None:
+             prompt_token_ids = [0] * len(self.prompt_embeds)
+ 
++        metrics = None
++        if self.stats and finished:
++            # Durations (seconds) from the recorded stat timestamps;
++            # preemptions fall within the prefill/decode intervals.
++            queued_time = self.stats.scheduled_ts - self.stats.queued_ts
++            prefill_time = self.stats.first_token_ts - self.stats.scheduled_ts
++            decode_time = self.stats.last_token_ts - self.stats.first_token_ts
++            inference_time = (self.stats.last_token_ts
++                              - self.stats.scheduled_ts)
++            total_preemption_ms = self.stats.total_preemption_time * 1000
++
++            # Durations are stored in milliseconds.
++            metrics = RequestMetrics(
++                arrival_time=self.stats.arrival_time,
++                last_token_time=inference_time * 1000,
++                first_scheduled_time=(self.stats.scheduled_ts
++                                      if self.stats.scheduled_ts > 0 else None),
++                first_token_time=self.stats.first_token_latency * 1000,
++                time_in_queue=queued_time * 1000,
++                finished_time=time.time(),
++                model_forward_time=prefill_time * 1000,
++                model_execute_time=decode_time * 1000,
++                batch_metrics=self.batch_metrics.copy(),
++                preempted=self.stats.ever_preempted,
++                time_spent_in_preemption_ms=total_preemption_ms,
++            )
++
+         return RequestOutput(
+             request_id=request_id,
+             prompt=self.prompt,
+@@ -255,6 +286,7 @@ class RequestState:
+             prompt_logprobs=prompt_logprobs,
+             outputs=cast(list[CompletionOutput], outputs),
+             finished=finished,
++            metrics=metrics,
+             kv_transfer_params=kv_transfer_params,
+             num_cached_tokens=self.num_cached_tokens,
+         )
+@@ -382,6 +414,7 @@ class OutputProcessor:
+         engine_core_outputs: list[EngineCoreOutput],
+         engine_core_timestamp: Optional[float] = None,
+         iteration_stats: Optional[IterationStats] = None,
++        batch_metrics: Optional[tuple[BatchRequestMetrics, ...]] = None,
+     ) -> OutputProcessorOutput:
+         """
+         Process the EngineCoreOutputs:
+@@ -408,6 +441,24 @@ class OutputProcessor:
+         request_outputs: Union[list[RequestOutput],
+                                list[PoolingRequestOutput]] = []
+         reqs_to_abort: list[str] = []
++
++        if batch_metrics:
++            for metrics in batch_metrics:
++                if (req_state := self.request_states.get(metrics.request_id)
++                        ) is None:
++                    continue
++                if req_state.last_recorded_batch_id == metrics.batch_id:
++                    continue
++                req_state.batch_metrics.append(
++                    BatchMetrics(
++                        batch_id=metrics.batch_id,
++                        batch_total_tokens=metrics.batch_total_tokens,
++                        num_prefills=metrics.num_prompts,
++                        num_decodes=metrics.num_decodes,
++                        latency_ms=metrics.latency_ms,
++                    ))
++                req_state.last_recorded_batch_id = metrics.batch_id
++
+         for engine_core_output in engine_core_outputs:
+             req_id = engine_core_output.request_id
+             req_state = self.request_states.get(req_id)
+diff --git a/vllm/v1/engine/processor.py b/vllm/v1/engine/processor.py
+index 843ca9a..8edcb8a 100644
+--- a/vllm/v1/engine/processor.py
++++ b/vllm/v1/engine/processor.py
+@@ -20,7 +20,7 @@ from vllm.pooling_params import PoolingParams
+ from vllm.sampling_params import SamplingParams
+ from vllm.transformers_utils.tokenizer import AnyTokenizer
+ from vllm.utils import length_from_prompt_token_ids_or_embeds
+-from vllm.v1.engine import EngineCoreRequest
++from vllm.v1.engine import EngineCoreRequest, OrchestratorHint
+ from vllm.v1.structured_output.backend_guidance import (
+     validate_guidance_grammar)
+ from vllm.v1.structured_output.backend_lm_format_enforcer import (
+@@ -334,6 +334,7 @@ class Processor:
+         trace_headers: Optional[Mapping[str, str]] = None,
+         priority: int = 0,
+         data_parallel_rank: Optional[int] = None,
++        orchestrator_hints: Optional[list[OrchestratorHint]] = None
+     ) -> tuple[Optional[str], EngineCoreRequest]:
+ 
+         # TODO(woosuk): Support pooling models.
+@@ -456,6 +457,7 @@ class Processor:
+             priority=priority,
+             data_parallel_rank=data_parallel_rank,
+             trace_headers=trace_headers,
++            orchestrator_hints=orchestrator_hints
+         )
+ 
+     def _validate_model_inputs(self, encoder_inputs: Optional[SingletonInputs],
+diff --git a/vllm/v1/metrics/batch.py b/vllm/v1/metrics/batch.py
+new file mode 100644
+index 0000000..60ee22d
+--- /dev/null
++++ b/vllm/v1/metrics/batch.py
+@@ -0,0 +1,16 @@
++from __future__ import annotations
++
++import msgspec
++
++
++class BatchRequestMetrics(
++        msgspec.Struct,
++        array_like=True,  # type: ignore[call-arg]
++        omit_defaults=True,  # type: ignore[call-arg]
++        gc=False):  # type: ignore[call-arg]
++    batch_id: int
++    request_id: str
++    batch_total_tokens: int
++    num_prompts: int
++    num_decodes: int
++    latency_ms: float | None = None
+diff --git a/vllm/v1/metrics/stats.py b/vllm/v1/metrics/stats.py
+index 296c39e..013b5a7 100644
+--- a/vllm/v1/metrics/stats.py
++++ b/vllm/v1/metrics/stats.py
+@@ -72,6 +72,11 @@ class RequestStateStats:
+     # first token latency
+     first_token_latency: float = 0.0
+ 
++    # Preemption tracking
++    ever_preempted: bool = False
++    preemption_start_ts: float = 0.0
++    total_preemption_time: float = 0.0
++
+ 
+ @dataclass
+ class FinishedRequestStats:
+@@ -152,15 +157,26 @@ class IterationStats:
+             elif event.type == EngineCoreEventType.SCHEDULED:
+                 if req_stats.scheduled_ts == 0.0:  # ignore preemptions
+                     req_stats.scheduled_ts = event.timestamp
++                if req_stats.preemption_start_ts > 0.0:
++                    req_stats.total_preemption_time += (
++                        event.timestamp - req_stats.preemption_start_ts)
++                    req_stats.preemption_start_ts = 0.0
+                 LoRARequestStates.scheduled_request(lora_stats, req_id)
+             elif event.type == EngineCoreEventType.PREEMPTED:
+                 self.num_preempted_reqs += 1
++                req_stats.ever_preempted = True
++                req_stats.preemption_start_ts = event.timestamp
+                 LoRARequestStates.preempted_request(lora_stats, req_id)
+ 
+     def update_from_finished_request(self, finish_reason: "FinishReason",
+                                      num_prompt_tokens: int,
+                                      max_tokens_param: Optional[int],
+                                      req_stats: RequestStateStats):
++        if req_stats.preemption_start_ts > 0.0:
++            req_stats.total_preemption_time += (
++                req_stats.last_token_ts - req_stats.preemption_start_ts)
++            req_stats.preemption_start_ts = 0.0
++
+         e2e_latency = self._time_since(req_stats.arrival_time)
+ 
+         # Queued interval is from first QUEUED event to first SCHEDULED
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index ff10fa0..0047318 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -17,6 +17,7 @@ from vllm.v1.engine import (EngineCoreEvent, EngineCoreEventType,
+                             EngineCoreRequest, FinishReason)
+ from vllm.v1.structured_output.request import StructuredOutputRequest
+ from vllm.v1.utils import ConstantList
++from vllm.v1.core.kv_block_types import KVBlockType
+ 
+ if TYPE_CHECKING:
+     from vllm.lora.request import LoRARequest
+@@ -43,6 +44,8 @@ class Request:
+         trace_headers: Optional[Mapping[str, str]] = None,
+         block_hasher: Optional[Callable[["Request"],
+                                         list["BlockHash"]]] = None,
++        orchestrator_hints: Optional[dict[tuple[int, int],
++                                          KVBlockType]] = None,
+     ) -> None:
+         self.request_id = request_id
+         self.client_index = client_index
+@@ -122,11 +125,21 @@ class Request:
+             self.get_hash_new_full_blocks = partial(block_hasher, self)
+             self.block_hashes = self.get_hash_new_full_blocks()
+ 
++        self.orchestrator_hints: Optional[
++            dict[tuple[int, int], KVBlockType]] = orchestrator_hints
++
+     @classmethod
+     def from_engine_core_request(
+         cls, request: EngineCoreRequest,
+         block_hasher: Optional[Callable[["Request"], list["BlockHash"]]]
+     ) -> "Request":
++        orchestrator_hints = None
++        if request.orchestrator_hints:
++            orchestrator_hints = {
++                (h.start, h.end): KVBlockType(h.block_type)
++                for h in request.orchestrator_hints
++            }
++
+         return cls(
+             request_id=request.request_id,
+             client_index=request.client_index,
+@@ -145,6 +158,7 @@ class Request:
+             priority=request.priority,
+             trace_headers=request.trace_headers,
+             block_hasher=block_hasher,
++            orchestrator_hints=orchestrator_hints
+         )
+ 
+     def append_output_token_ids(
