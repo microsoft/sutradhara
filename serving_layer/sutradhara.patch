@@ -168,7 +168,7 @@ index 904f805..4e01ebf 100644
      app.config.update(
          {
              "AIOHTTP_TIMEOUT": AIOHTTP_TIMEOUT,
-@@ -97,65 +159,150 @@ def main():
+@@ -97,65 +159,151 @@ def main():
          }
      )
  
@@ -194,6 +194,7 @@ index 904f805..4e01ebf 100644
  
 -        # Use rate limiter as context manager
 +        prefill_req = data.copy()
++        prefill_req["min_tokens"] = 1
 +        prefill_req["max_tokens"] = 1
 +        prefill_req["stream"] = False
 +        prefill_req.pop("stream_options", None)
