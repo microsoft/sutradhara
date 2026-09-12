@@ -19,20 +19,24 @@ python run_experiments.py \
 
 | Arg | Description | Default |
 |-----|-------------|---------|
-| `--trace` | Trace file path(s) — one per GPU | required |
+| `--trace` | Trace file path(s) — one per experiment | required |
 | `--qps` | Poisson arrival rate(s) — one per `--trace` | required |
-| `--chunk-sizes` | Max batched tokens per GPU | required |
-| `--gpus` | GPU IDs | required |
-| `--numa-nodes` | NUMA node IDs (defaults to `--gpus`) | `--gpus` |
+| `--chunk-sizes` | Max batched tokens — one per `--trace` | required |
+| `--gpus` | GPU IDs — length must be `len(--trace) * --tensor-parallel-size` | required |
+| `--numa-nodes` | NUMA node IDs — one per `--trace` (defaults to the first GPU of each TP group) | first GPU / group |
 | `--requests` | Requests to replay (`0` = all) | `0` |
 | `--base-port` | Starting port for vLLM server(s) | `8000` |
 | `--gpu-memory-utilization` | GPU memory fraction | `0.90` |
 | `--seed` | Seed for the Poisson arrival schedule; also seeds request ordering unless `--shuffle-seed` is given | `42` |
 | `--shuffle-seed` | Seed for request ordering only, independent of arrivals (`-1` replays in trace order, unshuffled) | `--seed` |
-| `--model` | HuggingFace model name | `Qwen/Qwen3-14B` |
+| `--model` | HuggingFace model name (also passed as `--tokenizer` to `trace_replay`) | `Qwen/Qwen3-14B` |
+| `--tensor-parallel-size` | vLLM TP size; pass `TP` contiguous GPUs per experiment in `--gpus` | `1` |
+| `--max-model-len` | vLLM `--max-model-len` | `65536` |
+| `--sequential-tools` | Serialize in-iteration tool sleeps (auto-enabled with `--swe-trace`) | off |
 
-The list args (`--trace`, `--qps`, `--chunk-sizes`, `--gpus`, `--numa-nodes`)
-must have equal length: one experiment per GPU, run in parallel.
+`--trace`, `--qps`, and `--chunk-sizes` must have equal length (one value per
+experiment). Experiments run in parallel. With `--tensor-parallel-size t`,
+`--gpus` is partitioned into contiguous groups of `t`.
 
 ## Optimization flags
 
@@ -48,80 +52,78 @@ Flags compose into the output tag: `ps_ds`, `ps_ds_kv`, etc. No flags →
 
 ## Trace formats
 
-The default trace format is a JSON array of chat-message dicts. BFCL v4 traces
-use a different on-disk layout (JSONL) and a different prompt format (ChatML),
-so they need an explicit flag:
-
 | Flag | Description |
 |------|-------------|
-| `--prod-trace` | Parse the trace as JSON message arrays — the default; equivalent to passing neither flag |
-| `--bfcl-trace` | Parse the trace as BFCL v4 JSONL and use the ChatML prompt parsers |
+| `--prod-trace` | JSON message arrays — the default; equivalent to passing neither flag |
+| `--bfcl-trace` | BFCL v4 JSONL + ChatML prompt parsers |
+| `--swe-trace` | SWE-agent traces (terminus `<tool_call>` text or mini-swe structured) |
 
-The two are mutually exclusive; passing both is an error. `--prod-trace` exists
-to state the format explicitly on the command line and record it in
-`metadata.json` — it does not change behavior relative to omitting it.
+These flags are mutually exclusive. `--prod-trace` only records the format in
+`metadata.json`; behavior matches omitting it.
 
-`--bfcl-trace` switches three things at once: the trace loader, the KV-hint
-builder, and the prefill splitter. The trace file must be valid JSONL — one
-complete JSON object per line. A truncated final record is a malformed trace and
-will fail loudly rather than being silently skipped.
+`--bfcl-trace` switches the trace loader, KV-hint builder, and prefill splitter.
+The file must be valid JSONL (one complete JSON object per line). A truncated
+final record fails loudly rather than being skipped.
 
-**`--prefill-split` does nothing on BFCL traces.** The split-point logic only
-exists for the JSON message-array format; on ChatML it degrades to baseline and
-logs a warning. BFCL's full optimization stack is therefore `--decode-stream
---workload-aware-cache` (tag `ds_kv`), not `ps_ds_kv`.
+`--swe-trace` uses `swe_trace_loader` (dict-of-instances JSON, or a directory of
+`.json` files). Default experiment file:
+`experiment_traces/swe_bench_trace.json`. `--sequential-tools` is enabled
+automatically (bash tools share shell state, so in-iteration sleeps must sum).
+
+**`--prefill-split` does nothing on BFCL traces.** Split-point logic only exists
+for the JSON message-array format; on ChatML it degrades to baseline and logs a
+warning. BFCL's full stack is therefore `--decode-stream --workload-aware-cache`
+(tag `ds_kv`), not `ps_ds_kv`.
 
 ## BFCL capacity sweep
 
-`bfcl_capacity_sweep.sh` replays the BFCL trace at each QPS point, twice per
-point — baseline, then Sutradhara (`--decode-stream --workload-aware-cache`, tag
-`ds_kv`). It is self-contained; `--dry-run` prints the commands without launching
-anything.
+`bfcl_capacity_sweep.sh` replays the BFCL trace at each QPS point, twice —
+baseline, then Sutradhara (`--decode-stream --workload-aware-cache`, tag
+`ds_kv`). `--dry-run` prints commands without launching.
 
 ```bash
 ./scripts/bfcl_capacity_sweep.sh [--dry-run]
 ```
 
-Runs on a **single GPU**, sequentially: 6 QPS points × 2 arms = 12 runs. GPU and
-NUMA node come from `BFCL_GPU` (default 2) and `BFCL_NUMA` (default 0).
+Single GPU, sequential: 6 QPS points × 2 arms = 12 runs. Override with
+`BFCL_TRACE`, `BFCL_GPU` (default `2`), `BFCL_NUMA` (default `0`).
 
-Fixed for every run: `--chunk-sizes 256 --requests 56
---gpu-memory-utilization 0.65 --seed 42 --shuffle-seed -1`. Requests are never
-shuffled and the Poisson arrival seed is always 42, so both arms replay an
-identical arrival schedule.
+Fixed: `--chunk-sizes 256 --requests 56 --gpu-memory-utilization 0.65
+--seed 42 --shuffle-seed -1`. Prefill-split is omitted (no-op on ChatML).
 
-**`--prefill-split` is absent.** It is a no-op on BFCL's ChatML prompts, so the
-full BFCL stack is DS+KV, never PS+DS+KV.
+Default trace: `experiment_traces/bfcl_trace.json` (56 `web_search` requests).
+Results: `analysis/bfcl_paper_experiments.ipynb`.
 
-Results are read by `analysis/bfcl_paper_experiments.ipynb`, which prints the
-median FTR/E2E table directly from the CSVs under `experiments/`.
+## SWE-bench capacity sweep
 
-Both arms replay the **same** trace. Select it with the `BFCL_TRACE` environment
-variable:
+`swe_capacity_sweep.sh` replays the SWE-bench trace at each QPS point, twice —
+baseline, then Sutradhara (`--decode-stream`, tag `ds`). `--dry-run` prints
+commands without launching.
 
 ```bash
-BFCL_TRACE=experiment_traces/<file>.json ./bfcl_capacity_sweep.sh
+./scripts/swe_capacity_sweep.sh [--dry-run]
 ```
 
-The default trace, `experiment_traces/bfcl_trace.json`, holds 56 `web_search`
-requests with their recorded per-call tool latencies (1.094 s mean, 1.703 s
-stdev, 3.23 tool steps per request, tool fan-out 2.04).
+Tensor parallel 2, sequential: 5 QPS points × 2 arms = 10 runs. Override with
+`SWE_TRACE`, `SWE_GPUS` (default `0 1`), `SWE_NUMA` (default `0`), `SWE_MODEL`
+(default `Qwen/Qwen3-30B-A3B-Instruct-2507`).
 
-Model generalizability across serving models is not covered: `run_experiments.py`
-passes `--model` to the server but never passes a matching `--tokenizer` to
-`trace_replay`, so serving a non-Qwen model would compute KV hints and
-decode-stream trigger indices with the wrong tokenizer.
+Fixed: `--chunk-sizes 256 --requests 0 --gpu-memory-utilization 0.80
+--max-model-len 32768 --seed 42 --shuffle-seed -1 --tensor-parallel-size 2`.
+
+Default trace: `experiment_traces/swe_bench_trace.json` (16 terminus trajectories;
+tool latency from per-call `duration` wait budgets).
 
 ## Disaggregated serving
 
 `--disaggregated` runs prefill and decode on separate GPUs, connected by a proxy
 that routes requests and transfers the KV cache (via vLLM's `NixlConnector` over
-NVLink).
+NVLink). `--tensor-parallel-size > 1` is not supported in this mode.
 
 - GPUs are **paired**: first = prefill, second = decode (even count required).
-- `--trace`, `--qps`, `--chunk-sizes` take **one value per pair**.
+- `--trace`, `--qps`, `--chunk-sizes`, `--numa-nodes`: one value **per pair**.
 - Ports are auto-assigned, 3 per pair (prefill, decode, proxy), from `--base-port`.
-- Composes with all optimization flags; tags gain a `disagg` prefix
+- Composes with optimization flags; tags gain a `disagg` prefix
   (`disagg`, `disagg_ps`, …).
 
 ```bash
@@ -132,11 +134,14 @@ python run_experiments.py \
   --qps 0.01 0.01 \
   --chunk-sizes 256 256 \
   --gpus 0 1 2 3 \
-  --numa-nodes 0 1 2 3 \
+  --numa-nodes 0 1 \
   --requests 10
-# Pair 0: GPU0 prefill:8000 + GPU1 decode:8001 + proxy:8002
-# Pair 1: GPU2 prefill:8003 + GPU3 decode:8004 + proxy:8005
+# Pair 0: GPU0 prefill + GPU1 decode + proxy
+# Pair 1: GPU2 prefill + GPU3 decode + proxy
 ```
+
+`bfcl_disaggregated.sh` is the BFCL QPS sweep in this mode (`BFCL_TRACE`,
+`BFCL_GPUS`, `BFCL_NUMA_NODES`).
 
 ## Output layout
 

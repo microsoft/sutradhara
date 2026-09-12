@@ -10,6 +10,7 @@ Optimization tag is auto-derived from flags:  baseline | ps | ds | kv | ps_ds | 
 import argparse
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -44,7 +45,8 @@ def start_vllm_server(chunk_size, gpu, numa_node, port, log_file, metrics_dir,
                      gpu_memory_utilization=0.90,
                      track_eviction_types=False, workload_aware_cache=False,
                      kv_transfer_config=None, disable_chunked_prefill=False,
-                     extra_env="", model="Qwen/Qwen3-14B"):
+                     extra_env="", model="Qwen/Qwen3-14B",
+                     tensor_parallel_size=1, max_model_len=65536):
     # Async scheduling is required for KV pinning to take effect; off otherwise.
     async_flag = "--async-scheduling " if workload_aware_cache else ""
     eviction_env = "VLLM_TRACK_EVICTION_TYPES=1 " if track_eviction_types else ""
@@ -63,14 +65,20 @@ def start_vllm_server(chunk_size, gpu, numa_node, port, log_file, metrics_dir,
         """--rope-scaling '{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}' """
         if "qwen" in model.lower() else ""
     )
+    # TP>1: caller passes a comma-separated CUDA_VISIBLE_DEVICES list in `gpu`.
+    numa = (
+        f"numactl --cpunodebind {numa_node} --membind {numa_node} "
+        if shutil.which("numactl")
+        else ""
+    )
     cmd = (
         f"CUDA_VISIBLE_DEVICES={gpu} VLLM_METRICS_DIR={metrics_dir} "
         f"{eviction_env}{disable_priority}{extra_env}"
-        f"numactl --cpunodebind {numa_node} --membind {numa_node} "
+        f"{numa}"
         f"vllm serve {model} "
-        f"--tensor-parallel-size 1 "
+        f"--tensor-parallel-size {tensor_parallel_size} "
         f"{rope_flag}"
-        f"--max-model-len 65536 "
+        f"--max-model-len {max_model_len} "
         f"--max-num-batched-tokens {batched_tokens} "
         f"--dtype bfloat16 "
         f"--enable-prefix-caching "
@@ -138,19 +146,28 @@ def start_trace_replay(trace_file, num_requests, port, numa_node,
                        qps, metrics_dir, log_file, prefill_split,
                        decode_stream=False, workload_aware_cache=False,
                        track_eviction_types=False, seed=42, shuffle_seed=None,
-                       bfcl_trace=False, prod_trace=False):
+                       bfcl_trace=False, prod_trace=False, swe_trace=False,
+                       tokenizer=None, sequential_tools=False):
     ps_flag = "--prefill-split " if prefill_split else ""
     ds_flag = "--decode-tool-streaming " if decode_stream else ""
     wac_flag = "--workload-aware-cache " if workload_aware_cache else ""
     tet_flag = "--track-eviction-types " if track_eviction_types else ""
     bfcl_flag = "--bfcl-trace " if bfcl_trace else ""
     prod_flag = "--prod-trace " if prod_trace else ""
+    swe_flag = "--swe-trace " if swe_trace else ""
+    seq_flag = "--sequential-tools " if sequential_tools or swe_trace else ""
+    tok_flag = f"--tokenizer {tokenizer} " if tokenizer else ""
     # Omitted entirely when unset, so trace_replay falls back to --seed.
     shuffle_flag = (
         f"--shuffle-seed {shuffle_seed} " if shuffle_seed is not None else ""
     )
-    cmd = (
+    numa = (
         f"numactl --cpunodebind {numa_node} --membind {numa_node} "
+        if shutil.which("numactl")
+        else ""
+    )
+    cmd = (
+        f"{numa}"
         f"python -m sutradhara.orchestrator.trace_replay "
         f"--trace {trace_file} "
         f"--vllm-url http://localhost:{port} "
@@ -165,6 +182,9 @@ def start_trace_replay(trace_file, num_requests, port, numa_node,
         f"{tet_flag}"
         f"{bfcl_flag}"
         f"{prod_flag}"
+        f"{swe_flag}"
+        f"{seq_flag}"
+        f"{tok_flag}"
         f">> {log_file} 2>&1"
     )
     proc = subprocess.Popen(cmd, shell=True, preexec_fn=os.setsid)
@@ -224,8 +244,15 @@ def make_experiment_dir(base, trace_file, chunk_size, qps, prefill_split,
 
 def run(args):
     n = len(args.trace)
+    tp = args.tensor_parallel_size
     ports = [int(args.base_port) + i for i in range(n)]
     base = os.path.join(REPO_ROOT, "experiments")
+
+    # Group GPUs into TP-sized shards: exp i → gpus[i*tp : (i+1)*tp]
+    gpu_groups = []
+    for i in range(n):
+        group = args.gpus[i * tp : (i + 1) * tp]
+        gpu_groups.append(",".join(str(g) for g in group))
 
     # --- set up directories & metadata ---
     experiments = []
@@ -246,6 +273,7 @@ def run(args):
             "seed": args.seed,
             "shuffle_seed": args.shuffle_seed,
             "model": args.model,
+            "tensor_parallel_size": tp,
             "prefill_split": args.prefill_split,
             "decode_stream": args.decode_stream,
             "workload_aware_cache": args.workload_aware_cache,
@@ -253,8 +281,10 @@ def run(args):
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "bfcl_trace": args.bfcl_trace,
             "prod_trace": args.prod_trace,
+            "swe_trace": args.swe_trace,
+            "sequential_tools": bool(args.sequential_tools or args.swe_trace),
             "disaggregated": False,
-            "gpu": args.gpus[i],
+            "gpu": gpu_groups[i],
             "numa_node": args.numa_nodes[i],
             "port": ports[i],
         }
@@ -266,11 +296,11 @@ def run(args):
     # --- start vLLM servers ---
     vllm_procs = []
     try:
-        print(f"\nStarting {n} vLLM server(s)...")
+        print(f"\nStarting {n} vLLM server(s) (TP={tp})...")
         for i in range(n):
             vllm_procs.append(start_vllm_server(
                 chunk_size=args.chunk_sizes[i],
-                gpu=args.gpus[i],
+                gpu=gpu_groups[i],
                 numa_node=args.numa_nodes[i],
                 port=str(ports[i]),
                 log_file=os.path.join(experiments[i]["dir"], "logs", "vllm_server.log"),
@@ -279,12 +309,14 @@ def run(args):
                 track_eviction_types=args.track_eviction_types,
                 workload_aware_cache=args.workload_aware_cache,
                 model=args.model,
+                tensor_parallel_size=tp,
+                max_model_len=args.max_model_len,
             ))
 
         # health-check
         print("Waiting for servers...")
         for i, port in enumerate(ports):
-            if wait_for_server(str(port)):
+            if wait_for_server(str(port), timeout=600):
                 print(f"  ✓ port {port} ready")
             else:
                 print(f"  ✗ port {port} failed to start — aborting")
@@ -301,7 +333,8 @@ def run(args):
                 numa_node=args.numa_nodes[i],
                 qps=args.qps[i],
                 metrics_dir=os.path.join(experiments[i]["dir"], "metrics"),
-                log_file=os.path.join(experiments[i]["dir"], "logs", "trace_replay.log"),
+                log_file=os.path.join(experiments[i]["dir"], "logs",
+                                      "trace_replay.log"),
                 prefill_split=args.prefill_split,
                 decode_stream=args.decode_stream,
                 workload_aware_cache=args.workload_aware_cache,
@@ -310,6 +343,9 @@ def run(args):
                 shuffle_seed=args.shuffle_seed,
                 bfcl_trace=args.bfcl_trace,
                 prod_trace=args.prod_trace,
+                swe_trace=args.swe_trace,
+                tokenizer=args.model,
+                sequential_tools=args.sequential_tools,
             ))
 
         # wait for completion
@@ -368,6 +404,7 @@ def run_disaggregated(args):
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "bfcl_trace": args.bfcl_trace,
             "prod_trace": args.prod_trace,
+            "swe_trace": args.swe_trace,
             "disaggregated": True,
             "prefill_gpu": prefill_gpu,
             "decode_gpu": decode_gpu,
@@ -497,6 +534,8 @@ def run_disaggregated(args):
                 shuffle_seed=args.shuffle_seed,
                 bfcl_trace=args.bfcl_trace,
                 prod_trace=args.prod_trace,
+                swe_trace=args.swe_trace,
+                tokenizer=args.model,
             ))
 
         for i, proc in enumerate(replay_procs):
@@ -540,6 +579,8 @@ def main():
                               help="Run production traces")
     trace_format.add_argument("--bfcl-trace", action="store_true", default=False,
                               help="Run BFCL v4 trace(s)")
+    trace_format.add_argument("--swe-trace", action="store_true", default=False,
+                              help="Run SWE-agent trace(s) (terminus/mini-swe)")
     p.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     p.add_argument("--seed", type=int, default=42,
                    help="Random seed for the Poisson arrival schedule; also "
@@ -551,6 +592,14 @@ def main():
                         "trace order without shuffling)")
     p.add_argument("--model", type=str, default="Qwen/Qwen3-14B",
                    help="HuggingFace model name (default: Qwen/Qwen3-14B)")
+    p.add_argument("--tensor-parallel-size", type=int, default=1,
+                   help="vLLM TP size. With TP=t, pass t GPUs "
+                        "per experiment in --gpus (grouped contiguously).")
+    p.add_argument("--max-model-len", type=int, default=65536,
+                   help="vLLM --max-model-len (default: 65536)")
+    p.add_argument("--sequential-tools", action="store_true", default=False,
+                   help="Serialize in-iteration tool sleeps (auto-on with "
+                        "--swe-trace)")
     p.add_argument("--disaggregated", action="store_true", default=False,
                    help="Disaggregated prefill/decode: GPUs are paired "
                         "(first=prefill, second=decode). --trace/--qps/"
@@ -559,6 +608,9 @@ def main():
     args = p.parse_args()
 
     if args.disaggregated:
+        if args.tensor_parallel_size != 1:
+            p.error("--tensor-parallel-size > 1 is not supported with "
+                    "--disaggregated yet")
         if len(args.gpus) % 2 != 0:
             p.error("--gpus must have even length in disaggregated mode")
         n_pairs = len(args.gpus) // 2
@@ -572,13 +624,27 @@ def main():
                     "mode (one value per GPU pair)")
         run_disaggregated(args)
     else:
+        tp = args.tensor_parallel_size
+        if tp < 1:
+            p.error("--tensor-parallel-size must be >= 1")
+        n = len(args.trace)
+        if len(args.gpus) != n * tp:
+            p.error(
+                f"--gpus must have length == len(--trace) * "
+                f"--tensor-parallel-size ({n}*{tp}={n * tp}); got "
+                f"{len(args.gpus)}"
+            )
         if args.numa_nodes is None:
-            args.numa_nodes = list(args.gpus)
-        lists = [args.trace, args.qps, args.chunk_sizes, args.gpus,
-                 args.numa_nodes]
+            # One NUMA bind per experiment (first GPU of each TP group).
+            args.numa_nodes = [args.gpus[i * tp] for i in range(n)]
+        if len(args.numa_nodes) != n:
+            p.error(
+                f"--numa-nodes must have length == len(--trace) ({n}); "
+                f"got {len(args.numa_nodes)}"
+            )
+        lists = [args.trace, args.qps, args.chunk_sizes]
         if len(set(len(l) for l in lists)) != 1:
-            p.error("--trace, --qps, --chunk-sizes, --gpus, --numa-nodes "
-                    "must have equal length")
+            p.error("--trace, --qps, --chunk-sizes must have equal length")
         run(args)
 
 
