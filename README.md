@@ -55,9 +55,10 @@ Then `pixi shell` to enter the environment, or prefix commands with `pixi run`.
 ## Running experiments
 
 `scripts/run_experiments.py` starts a patched vLLM server, replays an agentic
-trace against it, and writes metrics into a structured directory. See
-[`scripts/README.md`](scripts/README.md) for all options and the optimization
-flags.
+trace against it, and writes metrics into a structured directory. Trace formats
+include production message arrays, BFCL v4, and SWE-bench (terminus agent).
+See [`scripts/README.md`](scripts/README.md) for all options and the
+optimization flags.
 
 ## Uninstall
 

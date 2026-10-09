@@ -89,6 +89,7 @@ class OrchestratorSimulator:
         workload_aware_caching: bool = False,
         track_max_kv_hits: bool = False,
         prefill_splitter: Optional[PrefillSplitter] = None,
+        sequential_tools: bool = False,
     ):
         self.vllm_client = vllm_client
         self.tool_simulator = tool_simulator
@@ -107,6 +108,7 @@ class OrchestratorSimulator:
             workload_aware_caching=self.workload_aware_caching,
             track_max_kv_hits=track_max_kv_hits,
             prefill_splitter=prefill_splitter,
+            sequential_tools=sequential_tools,
         )
 
     def submit(self, agentic_request: AgenticRequest, arrival_s: float) -> None:
@@ -162,6 +164,31 @@ class OrchestratorSimulator:
         save_metrics_csv(metrics_dir, outcomes)
 
 
+class SequentialToolCall:
+    """
+    Optionally serialize tool sleeps within one decode drain.
+    """
+
+    def __init__(self, sequential: bool) -> None:
+        self._sequential = sequential
+        self._tail: Optional[asyncio.Task] = None
+
+    def launch(self, coro) -> asyncio.Task:
+        if not self._sequential:
+            return asyncio.create_task(coro)
+
+        prev = self._tail
+
+        async def _run():
+            if prev is not None:
+                await prev
+            return await coro
+
+        task = asyncio.create_task(_run())
+        self._tail = task
+        return task
+
+
 class AgenticRequestReplayer:
     def __init__(
         self,
@@ -172,6 +199,7 @@ class AgenticRequestReplayer:
         workload_aware_caching: bool = False,
         track_max_kv_hits: bool = False,
         prefill_splitter: Optional[PrefillSplitter] = None,
+        sequential_tools: bool = False,
     ):
         self.vllm_client = vllm_client
         self.tool_simulator = tool_simulator
@@ -180,6 +208,7 @@ class AgenticRequestReplayer:
         self.workload_aware_caching = workload_aware_caching
         self.track_max_kv_hits = track_max_kv_hits
         self.prefill_splitter = prefill_splitter or ProductionPrefillSplitter()
+        self.sequential_tools = sequential_tools
 
     def _max_kv_hits(self, prompt: str) -> float:
         """Theoretical max KV prefix-reuse ratio for *prompt*."""
@@ -221,15 +250,13 @@ class AgenticRequestReplayer:
         response.update(overrides)
         return response
 
-    def _launch_tool(self, tool_info: Dict) -> asyncio.Task:
-        """Create an asyncio task that simulates a single tool call."""
+    def _tool_coro(self, tool_info: Dict):
+        """Coroutine that simulates a single tool call."""
         latency = tool_info.get("latency", 0)
-        return asyncio.create_task(
-            self.tool_simulator.execute_tool(
-                tool_name="simulated_tool",
-                tool_args={"trace_info": tool_info},
-                latency_ms=latency,
-            )
+        return self.tool_simulator.execute_tool(
+            tool_name="simulated_tool",
+            tool_args={"trace_info": tool_info},
+            latency_ms=latency,
         )
 
     async def _drive_split_a(
@@ -281,6 +308,7 @@ class AgenticRequestReplayer:
 
         token_idx = 0
         launched_tool_tasks = []
+        sequential_tool_call = SequentialToolCall(self.sequential_tools)
 
         async for chunk in generator:
             token = chunk.get("text", "")
@@ -298,7 +326,9 @@ class AgenticRequestReplayer:
                     logger.info(
                         "Triggering tool at token %d for %s", token_idx, request_id_tag
                     )
-                    launched_tool_tasks.append(self._launch_tool(tool_info))
+                    launched_tool_tasks.append(
+                        sequential_tool_call.launch(self._tool_coro(tool_info))
+                    )
                 token_idx += 1
 
             if chunk.get("usage"):
@@ -312,7 +342,9 @@ class AgenticRequestReplayer:
             if first_tool_dispatch_time is None:
                 first_tool_dispatch_time = time.perf_counter()
             logger.info("Triggering deferred tool for %s", request_id_tag)
-            launched_tool_tasks.append(self._launch_tool(tool_info))
+            launched_tool_tasks.append(
+                sequential_tool_call.launch(self._tool_coro(tool_info))
+            )
 
         tool_results = []
         pending_tasks = []

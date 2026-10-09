@@ -8,6 +8,7 @@ from sutradhara.orchestrator.common.poisson_arrival_distribution import (
 )
 from sutradhara.orchestrator.common.request_iter_extractor import load_agentic_requests
 from sutradhara.orchestrator.common.bfcl_trace_loader import load_bfcl_agentic_requests
+from sutradhara.orchestrator.common.swe_trace_loader import load_swe_agentic_requests
 from sutradhara.orchestrator.llm_client.vllm_client import VLLMClient
 from sutradhara.orchestrator.logger.logger import setup_logging
 from sutradhara.orchestrator.optimizations.kv_hints import (
@@ -32,7 +33,7 @@ async def async_main(args):
         kv_hint_builder = BFCLKVHintBuilder()
         prefill_splitter = BFCLPrefillSplitter() if args.prefill_split else None
     else:
-        # --prod-trace / production is the default.
+        # --prod-trace / --swe-trace / production is the default.
         kv_hint_builder = ProductionKVHintBuilder()
         prefill_splitter = ProductionPrefillSplitter()
 
@@ -52,6 +53,10 @@ async def async_main(args):
 
         if args.bfcl_trace:
             requests_list = load_bfcl_agentic_requests(
+                args.trace, tokenize_fn=vllm_client.tokenize
+            )
+        elif args.swe_trace:
+            requests_list = load_swe_agentic_requests(
                 args.trace, tokenize_fn=vllm_client.tokenize
             )
         else:
@@ -74,6 +79,7 @@ async def async_main(args):
             or args.track_eviction_types,
             track_max_kv_hits=args.track_max_kv_hits,
             prefill_splitter=prefill_splitter,
+            sequential_tools=args.sequential_tools or args.swe_trace,
         )
 
         # --shuffle-seed falls back to --seed, so passing only --seed keeps the
@@ -132,6 +138,12 @@ def main():
         default=False,
         help="Run BFCL v4 trace (JSONL, ChatML prompts)",
     )
+    trace_format.add_argument(
+        "--swe-trace",
+        action="store_true",
+        default=False,
+        help="Run SWE Bench trace",
+    )
     parser.add_argument(
         "--vllm-url",
         default="http://localhost:8000",
@@ -170,6 +182,12 @@ def main():
         action="store_true",
         default=False,
         help="Enable decode tool streaming optimization (dispatch tools early)",
+    )
+    parser.add_argument(
+        "--sequential-tools",
+        action="store_true",
+        default=False,
+        help="Serialize tool execution within an iteration (auto-on with --swe-trace)",
     )
     parser.add_argument(
         "--workload-aware-cache",
